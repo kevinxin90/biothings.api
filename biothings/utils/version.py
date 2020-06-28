@@ -152,8 +152,14 @@ def check_new_version(folder, max_commits=10):
     return new_info
 
 def get_version(folder):
-    repo = Repo(folder, search_parent_directories=True)  # app or lib dir
-    url = repo.remotes.origin.url
+    try:
+        repo = Repo(folder, search_parent_directories=True)  # app or lib dir
+        url = repo.remotes.origin.url
+    except:
+        return {"branch": "master",
+                "commit": "5e2d26",
+                "date": '2020-05-20T16:03:50-07:00',
+                "giturl": "https://github.com/biothings/pending.api.git"}
     try:
         commit = repo.head.object.hexsha[:6]
         commitdate = repo.head.object.committed_datetime.isoformat()
