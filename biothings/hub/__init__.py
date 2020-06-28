@@ -343,6 +343,8 @@ class HubServer(object):
         self.shell.server = self  # propagate server instance in shell
         # so it's accessible from the console if needed
         self.configure_remaining_features()
+        self.configure_autohub_feature()
+        print("autohub feature configured")
         self.configure_commands()
         self.configure_extra_commands()
         self.shell.set_commands(self.commands, self.extra_commands)
