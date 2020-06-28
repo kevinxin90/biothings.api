@@ -152,7 +152,7 @@ def check_new_version(folder, max_commits=10):
     return new_info
 
 def get_version(folder):
-    repo = Repo(folder)  # app or lib dir
+    repo = Repo(folder, search_parent_directories=True)  # app or lib dir
     url = repo.remotes.origin.url
     try:
         commit = repo.head.object.hexsha[:6]
