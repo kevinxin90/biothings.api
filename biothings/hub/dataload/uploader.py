@@ -1,23 +1,29 @@
-import time
-import os
-import copy
-import datetime
 import asyncio
-import logging as loggingmod
-from functools import partial
+import datetime
+import importlib
 import inspect
+import os
+import time
+from functools import partial
+from typing import Iterable, Optional
 
-from biothings.utils.common import get_timestamp, get_random_string, timesofar
-from biothings.utils.hub_db import get_src_dump, get_src_master
-from biothings.utils.mongo import get_src_conn
-from biothings.utils.manager import BaseSourceManager, ResourceNotFound
-from .storage import IgnoreDuplicatedStorage, MergerStorage, \
-    BasicStorage, NoBatchIgnoreDuplicatedStorage, \
-    NoStorage
-from biothings.utils.loggers import get_logger
-from biothings.utils.version import get_source_code_info
 from biothings import config
-from biothings.hub import DUMPER_CATEGORY, UPLOADER_CATEGORY, BUILDER_CATEGORY
+from biothings.hub import BUILDER_CATEGORY, DUMPER_CATEGORY, UPLOADER_CATEGORY
+from biothings.hub.dataload.manager import BaseSourceManager
+from biothings.hub.manager import ResourceNotFound
+from biothings.utils.common import first_exception, get_random_string, get_timestamp, timesofar
+from biothings.utils.hub_db import get_src_conn, get_src_dump, get_src_master
+from biothings.utils.loggers import get_logger
+from biothings.utils.storage import (
+    BasicStorage,
+    IgnoreDuplicatedStorage,
+    MergerStorage,
+    NoBatchIgnoreDuplicatedStorage,
+    NoStorage,
+)
+from biothings.utils.validator import commit_validator, import_validator, validate_documents
+from biothings.utils.version import get_source_code_info
+from biothings.utils.workers import upload_worker
 
 logging = config.logger
 
@@ -30,60 +36,15 @@ class ResourceError(Exception):
     pass
 
 
-def upload_worker(name, storage_class, loaddata_func, col_name, batch_size,
-                  batch_num, *args):
+class BaseSourceUploader:
     """
-    Pickable job launcher, typically running from multiprocessing.
-    storage_class will instanciate with col_name, the destination
-    collection name. loaddata_func is the parsing/loading function,
-    called with `*args`.
-    """
-    data = []
-    try:
-        data = loaddata_func(*args)
-        if type(storage_class) is tuple:
-            klass_name = "_".join(
-                [k.__class__.__name__ for k in storage_class])
-            storage = type(klass_name, storage_class, {})(None, col_name,
-                                                          loggingmod)
-        else:
-            storage = storage_class(None, col_name, loggingmod)
-        return storage.process(data, batch_size)
-    except Exception as e:
-        logger_name = "%s_batch_%s" % (name, batch_num)
-        logger, logfile = get_logger(logger_name, config.LOG_FOLDER)
-        logger.exception(e)
-        logger.error("Parameters:\nname=%s\nstorage_class=%s\n" % (name, storage_class)
-                     + "loaddata_func=%s\ncol_name=%s\nbatch_size=%s\n" % (loaddata_func, col_name, batch_size)
-                     + "args=%s" % repr(args))
-        import pickle
-        pickfile = os.path.join(os.path.dirname(logfile),
-                                "%s.pick" % logger_name)
-        try:
-            pickle.dump(
-                {
-                    "exc": e,
-                    "params": {
-                        "name": name,
-                        "storage_class": storage_class
-                    },
-                    "loaddata_func": loaddata_func,
-                    "col_name": col_name,
-                    "batch_size": batch_size,
-                    "args": args
-                }, open(pickfile, "wb"))
-        except TypeError as ie:
-            logger.warning("Could not pickle batch errors: %s" % ie)
-        raise e
-
-
-class BaseSourceUploader(object):
-    '''
     Default datasource uploader. Database storage can be done
     in batch or line by line. Duplicated records aren't not allowed
-    '''
+    """
+
     # TODO: fix this delayed import
     from biothings import config
+
     __database__ = config.DATA_SRC_DATABASE
 
     # define storage strategy, override in subclass as necessary
@@ -104,15 +65,12 @@ class BaseSourceUploader(object):
 
     keep_archive = 10  # number of archived collection to keep. Oldest get dropped first.
 
-    def __init__(self,
-                 db_conn_info,
-                 collection_name=None,
-                 log_folder=None,
-                 *args,
-                 **kwargs):
+    auto_validate = False  # if True, will automatically validate the data using the Pydantic model
+
+    def __init__(self, db_conn_info, collection_name=None, log_folder=None, *args, **kwargs):
         """db_conn_info is a database connection info tuple (host,port) to fetch/store
         information about the datasource's state."""
-        # non-pickable attributes (see __getattr__, prepare() and unprepare())
+        # non-pickable attributes (see __getattr__, prepare() and __getstate__())
         self.init_state()
         self.db_conn_info = db_conn_info
         self.timestamp = datetime.datetime.now()
@@ -129,6 +87,10 @@ class BaseSourceUploader(object):
         self.data_folder = None
         self.prepared = False
         self.src_doc = {}  # will hold src_dump's doc
+        # Pydantic model settings
+        self.auto_validate = self.__class__.auto_validate
+        self.validation_dir = kwargs.get("validation_dir")
+        self.validation_model = ""
 
     @property
     def fullname(self):
@@ -158,17 +120,12 @@ class BaseSourceUploader(object):
             "conn": None,
             "collection": None,
             "src_dump": None,
-            "logger": None
+            "logger": None,
         }
 
-    def prepare(self, state={}):
-        """Sync uploader information with database (or given state dict)"""
+    def prepare(self):
+        """Sync uploader information with database"""
         if self.prepared:
-            return
-        if state:
-            # let's be explicit, _state takes what it wants
-            for k in self._state:
-                self._state[k] = state[k]
             return
         self._state["conn"] = get_src_conn()
         self._state["db"] = self._state["conn"][self.__class__.__database__]
@@ -176,28 +133,22 @@ class BaseSourceUploader(object):
         self._state["src_dump"] = self.prepare_src_dump()
         self._state["src_master"] = get_src_master()
         self._state["logger"], self.logfile = self.setup_log()
-        self.data_folder = self.src_doc.get("download", {}).get("data_folder") or \
-            self.src_doc.get("data_folder")
+        self.data_folder = self.src_doc.get("download", {}).get("data_folder") or self.src_doc.get("data_folder")
         # flag ready
         self.prepared = True
 
-    def unprepare(self):
+    def __getstate__(self):
         """
-        reset anything that's not pickable (so self can be pickled)
-        return what's been reset as a dict, so self can be restored
-        once pickled
+        Blank _state and the prepared flag for pickling.
+
+        update_data() defers load_data() to worker processes, which pickles self,
+        and _state holds unpicklable mongo clients. The worker rebuilds what it
+        needs on first use through the lazy properties, which only run while
+        prepared is False. copy.deepcopy() goes through here too.
         """
-        state = {
-            "db": self._state["db"],
-            "conn": self._state["conn"],
-            "collection": self._state["collection"],
-            "src_dump": self._state["src_dump"],
-            "src_master": self._state["src_master"],
-            "logger": self._state["logger"]
-        }
-        for k in state:
-            self._state[k] = None
-        self.prepared = False
+        state = self.__dict__.copy()
+        state["_state"] = dict.fromkeys(self._state)
+        state["prepared"] = False
         return state
 
     def get_predicates(self):
@@ -205,25 +156,31 @@ class BaseSourceUploader(object):
         Return a list of predicates (functions returning true/false, as in math logic)
         which instructs/dictates if job manager should start a job (process/thread)
         """
+
         def no_dumper_running(job_manager):
             """
             Dumpers could change the files uploader is currently using
             """
-            return len([j for j in job_manager.jobs.values() if
-                        j["source"] == self.fullname.split(".")[0] and j["category"] == DUMPER_CATEGORY]) == 0
+            return (
+                len(
+                    [
+                        j
+                        for j in job_manager.jobs.values()
+                        if j["source"] == self.fullname.split(".")[0] and j["category"] == DUMPER_CATEGORY
+                    ]
+                )
+                == 0
+            )
 
         def no_builder_running(job_manager):
             """
             Builders (mergers) read data from single datasource under control of uploader
             don't change the data while it's being used
             """
-            return len([
-                j for j in job_manager.jobs.values()
-                if j["category"] == BUILDER_CATEGORY
-            ]) == 0
+            return len([j for j in job_manager.jobs.values() if j["category"] == BUILDER_CATEGORY]) == 0
 
         # TODO: can't use this one below for parallized uploader
-        #def no_same_uploader_running(job_manager):
+        # def no_same_uploader_running(job_manager):
         #    """
         #    Avoid collision at mongo's level (and what's the point anyway?)
         #    """
@@ -240,7 +197,7 @@ class BaseSourceUploader(object):
             "category": UPLOADER_CATEGORY,
             "source": self.fullname,
             "step": "",
-            "description": ""
+            "description": "",
         }
         preds = self.get_predicates()
         if preds:
@@ -249,29 +206,25 @@ class BaseSourceUploader(object):
 
     def check_ready(self, force=False):
         if not self.src_doc:
-            raise ResourceNotReady(
-                "Missing information for source '%s' to start upload" %
-                self.main_source)
+            raise ResourceNotReady(f"Missing information for source '{self.main_source}' to start upload")
         if not self.src_doc.get("download", {}).get("data_folder"):
-            raise ResourceNotReady("No data folder found for resource '%s'" %
-                                   self.name)
-        if not force and not self.src_doc.get("download",
-                                              {}).get("status") == "success":
-            raise ResourceNotReady(
-                "No successful download found for resource '%s'" % self.name)
+            raise ResourceNotReady("No data folder found for resource '%s'" % self.name)
+        if not force and not self.src_doc.get("download", {}).get("status") == "success":
+            raise ResourceNotReady("No successful download found for resource '%s'" % self.name)
         if not os.path.exists(self.data_folder):
-            raise ResourceNotReady(
-                "Data folder '%s' doesn't exist for resource '%s'" %
-                (self.data_folder, self.name))
+            raise ResourceNotReady(f"Data folder '{self.data_folder}' doesn't exist for resource '{self.name}'")
         job = self.src_doc.get("upload", {}).get("job", {}).get(self.name)
         if not force and job:
-            raise ResourceNotReady(
-                "Resource '%s' is already being uploaded (job: %s)" %
-                (self.name, job))
+            raise ResourceNotReady(f"Resource '{self.name}' is already being uploaded (job: {job})")
 
-    def load_data(self, data_folder):
-        """Parse data inside data_folder and return structure ready to be
-        inserted in database"""
+    def load_data(self, data_path):
+        """
+        Parse data from data_path and return structure ready to be inserted in database
+        In general, data_path is a folder path.
+        But in parallel mode (use parallelizer option), data_path is a file path
+        :param data_path: It can be a folder path or a file path
+        :return: structure ready to be inserted in database
+        """
         raise NotImplementedError("Implement in subclass")
 
     @classmethod
@@ -280,12 +233,11 @@ class BaseSourceUploader(object):
         return {}  # default to nothing...
 
     def make_temp_collection(self):
-        '''Create a temp collection for dataloading, e.g., entrez_geneinfo_INEMO.'''
+        """Create a temp collection for dataloading, e.g., entrez_geneinfo_INEMO."""
         if self.temp_collection_name:
             # already set
             return
-        self.temp_collection_name = self.collection_name + '_temp_' + get_random_string(
-        )
+        self.temp_collection_name = self.collection_name + "_temp_" + get_random_string()
         return self.temp_collection_name
 
     def clean_archived_collections(self):
@@ -293,53 +245,47 @@ class BaseSourceUploader(object):
         prefix = "%s_archive_" % self.name
         cols = [c for c in self.db.collection_names() if c.startswith(prefix)]
         tmp_prefix = "%s_temp_" % self.name
-        tmp_cols = [
-            c for c in self.db.collection_names() if c.startswith(tmp_prefix)
-        ]
+        tmp_cols = [c for c in self.db.collection_names() if c.startswith(tmp_prefix)]
         # timestamp is what's after _archive_, YYYYMMDD, so we can sort it safely
         cols = sorted(cols, reverse=True)
-        to_drop = cols[self.keep_archive:] + tmp_cols
+        to_drop = cols[self.keep_archive :] + tmp_cols  # noqa: E203
         for colname in to_drop:
-            self.logger.info("Cleaning old archive/temp collection '%s'" %
-                             colname)
+            self.logger.info("Cleaning old archive/temp collection '%s'" % colname)
             self.db[colname].drop()
 
     def switch_collection(self):
-        '''after a successful loading, rename temp_collection to regular collection name,
-           and renaming existing collection to a temp name for archiving purpose.
-        '''
-        if self.temp_collection_name and self.db[
-                self.temp_collection_name].count() > 0:
+        """
+        after a successful loading, rename temp_collection to regular collection name,
+        and renaming existing collection to a temp name for archiving purpose.
+        """
+
+        if self.temp_collection_name and self.db[self.temp_collection_name].count() > 0:
             if self.collection_name in self.db.collection_names():
                 # renaming existing collections
-                new_name = '_'.join([
-                    self.collection_name, 'archive',
-                    get_timestamp(),
-                    get_random_string()
-                ])
+                new_name = "_".join([self.collection_name, "archive", get_timestamp(), get_random_string()])
+                self.logger.info(
+                    "Renaming collection '%s' to '%s' for archiving purpose." % (self.collection_name, new_name)
+                )
                 self.collection.rename(new_name, dropTarget=True)
-            self.logger.info("Renaming collection '%s' to '%s'" %
-                             (self.temp_collection_name, self.collection_name))
+            self.logger.info("Renaming collection '%s' to '%s'", self.temp_collection_name, self.collection_name)
             self.db[self.temp_collection_name].rename(self.collection_name)
+        elif self.temp_collection_name and self.db[self.collection_name].count() == 0:
+            raise ResourceError("No data parsed into temp collection")
         else:
-            raise ResourceError("No temp collection (or it's empty)")
+            raise ResourceError("No temp collection to switch to")
 
-    def post_update_data(self, steps, force, batch_size, job_manager,
-                         **kwargs):
+    def post_update_data(self, steps, force, batch_size, job_manager, **kwargs):
         """Override as needed to perform operations after
-           data has been uploaded"""
+        data has been uploaded"""
         pass
 
-    @asyncio.coroutine
-    def update_data(self, batch_size, job_manager):
+    async def update_data(self, batch_size, job_manager):
         """
         Iterate over load_data() to pull data and store it
         """
         pinfo = self.get_pinfo()
         pinfo["step"] = "update_data"
-        got_error = False
-        self.unprepare()
-        job = yield from job_manager.defer_to_process(
+        job = await job_manager.defer_to_process(
             pinfo,
             partial(
                 upload_worker,
@@ -349,36 +295,29 @@ class BaseSourceUploader(object):
                 self.temp_collection_name,
                 batch_size,
                 1,  # no batch, just #1
-                self.data_folder))
-
-        def uploaded(f):
-            nonlocal got_error
-            if type(f.result()) != int:
-                got_error = Exception(
-                    "upload error (should have a int as returned value got %s"
-                    % repr(f.result()))
-
-        job.add_done_callback(uploaded)
-        yield from job
-        if got_error:
-            raise got_error
+                self.data_folder,
+            ),
+        )
+        res = await job
+        if not isinstance(res, int):
+            raise Exception(f"upload error (should have a int as returned value got {repr(res)}")
         self.switch_collection()
 
     def generate_doc_src_master(self):
         _doc = {
             "_id": str(self.name),
             "name": self.regex_name and self.regex_name or str(self.name),
-            "timestamp": datetime.datetime.now()
+            "timestamp": datetime.datetime.now(),
         }
         # store mapping
         _map = self.__class__.get_mapping()
         if _map:
-            _doc['mapping'] = _map
+            _doc["mapping"] = _map
         # type of id being stored in these docs
-        if hasattr(self.__class__, '__metadata__'):
+        if hasattr(self.__class__, "__metadata__"):
             _doc.update(self.__class__.__metadata__)
+
         # try to find information about the uploader source code
-        from biothings.hub.dataplugin.assistant import AssistedUploader
         if issubclass(self.__class__, AssistedUploader):
             # it's a plugin, we'll just point to the plugin folder
             src_file = self.__class__.DATA_PLUGIN_FOLDER
@@ -388,6 +327,17 @@ class BaseSourceUploader(object):
         if info:
             _doc.setdefault("src_meta", {}).update({"code": info})
         return _doc
+
+    def get_current_and_new_master(self):
+        new = self.generate_doc_src_master() or {}
+        dkey = {"_id": new["_id"]}
+        current = self.src_master.find_one(dkey) or {}
+        if current.get("src_meta") != new.get("src_meta"):
+            return {
+                "kclass": f"{self.__class__.__module__}.{self.__class__.__name__}",
+                "current": current.get("src_meta"),
+                "new": new.get("src_meta"),
+            }
 
     def update_master(self):
         _doc = self.generate_doc_src_master()
@@ -413,25 +363,31 @@ class BaseSourceUploader(object):
         # with arguments like 'init' and 'transient'...
         if status.endswith("ing"):
             # record some "in-progress" information
-            upload_info[
-                'step'] = self.name  # this is the actual collection name
-            upload_info['temp_collection'] = self.temp_collection_name
-            upload_info['pid'] = os.getpid()
-            upload_info['logfile'] = self.logfile
-            upload_info['started_at'] = datetime.datetime.now().astimezone()
-            self.src_dump.update_one({"_id": self.main_source},
-                                     {"$set": {
-                                         job_key: upload_info
-                                     }})
+
+            upload_info["step"] = self.name  # this is the actual collection name
+            upload_info["temp_collection"] = self.temp_collection_name
+            upload_info["pid"] = os.getpid()
+            upload_info["logfile"] = self.logfile
+            upload_info["started_at"] = datetime.datetime.now().astimezone()
+
+            # We should use the last_success from the last upload time as a default value for the current's last_success
+            # If last_success from the last upload doesn't exist or is None, and last upload's status is success,
+            # the last upload's started_at will be used.
+            last_upload_info = self.src_doc.get(subkey, {}).get("jobs", {}).setdefault(self.name, {})
+            last_success = last_upload_info.get("last_success")
+            last_status = last_upload_info.get("status")
+            if not last_success and last_status == "success":
+                last_success = last_upload_info.get("started_at")
+            if last_success:
+                upload_info["last_success"] = last_success
+
+            self.src_dump.update_one({"_id": self.main_source}, {"$set": {job_key: upload_info}})
         else:
             # get release that's been uploaded from download part
             src_doc = self.src_dump.find_one({"_id": self.main_source}) or {}
             # back-compatibility while searching for release
-            release = src_doc.get("download",
-                                  {}).get("release") or src_doc.get("release")
-            data_folder = src_doc.get(
-                "download",
-                {}).get("data_folder") or src_doc.get("data_folder")
+            release = src_doc.get("download", {}).get("release") or src_doc.get("release")
+            data_folder = src_doc.get("download", {}).get("data_folder") or src_doc.get("data_folder")
             # only register time when it's a final state
             # also, keep previous uploading information
             upd = {}
@@ -444,15 +400,19 @@ class BaseSourceUploader(object):
             upd["%s.step" % job_key] = self.name  # collection name
             upd["%s.release" % job_key] = release
             upd["%s.data_folder" % job_key] = data_folder
+            # Update last success upload time only when the success
+            if status == "success":
+                upd["%s.last_success" % job_key] = (src_doc["upload"]["jobs"].get(self.name) or {}).get("started_at")
             self.src_dump.update_one({"_id": self.main_source}, {"$set": upd})
 
-    @asyncio.coroutine
-    def load(self,
-             steps=["data", "post", "master", "clean"],
-             force=False,
-             batch_size=10000,
-             job_manager=None,
-             **kwargs):
+    async def load(
+        self,
+        steps=("data", "post", "master", "clean"),
+        force=False,
+        batch_size=10000,
+        job_manager=None,
+        **kwargs,
+    ):
         """
         Main resource load process, reads data from doc_c using chunk sized as batch_size.
         steps defines the different processes used to laod the resource:
@@ -462,8 +422,13 @@ class BaseSourceUploader(object):
         """
         try:
             # check what to do
-            if type(steps) == str:
+            if isinstance(steps, tuple):
+                steps = list(
+                    steps
+                )  # may not be necessary, but previous steps default is a list, so let's be consistent
+            elif isinstance(steps, str):
                 steps = steps.split(",")
+
             update_data = "data" in steps
             update_master = "master" in steps
             post_update_data = "post" in steps
@@ -473,40 +438,23 @@ class BaseSourceUploader(object):
             if not self.temp_collection_name:
                 self.make_temp_collection()
             if self.db[self.temp_collection_name]:
-                self.db[self.temp_collection_name].drop(
-                )  # drop all existing records just in case.
+                self.db[self.temp_collection_name].drop()  # drop all existing records just in case.
             # sanity check before running
             self.check_ready(force)
-            self.logger.info("Uploading '%s' (collection: %s)" %
-                             (self.name, self.collection_name))
+            self.logger.info("Uploading '%s' (collection: %s)" % (self.name, self.collection_name))
             self.register_status("uploading")
             if update_data:
-                # unsync to make it pickable
-                state = self.unprepare()
-                cnt = yield from self.update_data(batch_size, job_manager,
-                                                  **kwargs)
-                self.prepare(state)
+                cnt = await self.update_data(batch_size, job_manager, **kwargs)
             if update_master:
                 self.update_master()
             if post_update_data:
-                got_error = False
-                self.unprepare()
                 pinfo = self.get_pinfo()
                 pinfo["step"] = "post_update_data"
-                f2 = yield from job_manager.defer_to_thread(
+                job = await job_manager.defer_to_thread(
                     pinfo,
-                    partial(self.post_update_data, steps, force, batch_size,
-                            job_manager, **kwargs))
-
-                def postupdated(f):
-                    nonlocal got_error
-                    if f.exception():
-                        got_error = f.exception()
-
-                f2.add_done_callback(postupdated)
-                yield from f2
-                if got_error:
-                    raise got_error
+                    partial(self.post_update_data, steps, force, batch_size, job_manager, **kwargs),
+                )
+                await job
             # take the total from update call or directly from collection
             cnt = cnt or self.db[self.collection_name].count()
             if clean_archives:
@@ -514,9 +462,9 @@ class BaseSourceUploader(object):
             self.register_status("success", count=cnt, err=None, tb=None)
             self.logger.info("success %s" % strargs, extra={"notify": True})
         except Exception as e:
-            self.logger.exception("failed %s: %s" % (strargs, e),
-                                  extra={"notify": True})
+            self.logger.exception("failed %s: %s" % (strargs, e), extra={"notify": True})
             import traceback
+
             self.logger.error(traceback.format_exc())
             self.register_status("failed", err=str(e), tb=traceback.format_exc())
             raise
@@ -525,11 +473,12 @@ class BaseSourceUploader(object):
         """Sync with src_dump collection, collection information (src_doc)
         Return src_dump collection"""
         src_dump = get_src_dump()
-        self.src_doc = src_dump.find_one({'_id': self.main_source}) or {}
+        self.src_doc = src_dump.find_one({"_id": self.main_source}) or {}
         return src_dump
 
     def setup_log(self):
-        return get_logger('upload_%s' % self.fullname)
+        log_folder = os.path.join(config.LOG_FOLDER, "dataload") if config.LOG_FOLDER else None
+        return get_logger("upload_%s" % self.fullname, log_folder=log_folder)
 
     def __getattr__(self, attr):
         """This catches access to unpicabkle attributes. If unset,
@@ -548,26 +497,114 @@ class BaseSourceUploader(object):
         else:
             raise AttributeError(attr)
 
+    def commit_pydantic_model(self, model_str):
+        try:
+            if model_dir := self.validation_dir:
+                self.logger.info("Generating model in validation_dir: %s", model_dir)
+                # create directory if it doesn't exist
+                if not os.path.exists(model_dir):
+                    os.makedirs(model_dir)
+            else:
+                raise ValueError("No module directory found for uploader source '%s'", self.fullname)
+            commit_validator(model_str, model_dir, self.name)
+            self.logger.info("Pydantic model created for uploader source '%s'", self.fullname)
+        except Exception as e:
+            self.logger.error("Error creating Pydantic model for uploader source '%s'", self.fullname)
+            raise e
+
+    def validate(self, model_path, docs: Optional[Iterable] = None):
+        """Validate documents in the collection using the Pydantic model
+        :param model_file: Pydantic model file to use for validation
+        :param docs: List of documents to validate
+        """
+
+        self.prepare()
+
+        model = import_validator(model_path, self.collection_name.casefold())
+        # for cli usage
+        if docs:
+            self.logger.info("Validating documents from an iterable")
+            validate_documents(model, docs)
+        else:
+            session = self._state["conn"].start_session()
+            src_collection = self._state["collection"]
+            self.logger.info("Validating documents from collection '%s'", src_collection)
+
+            with session:
+                docs = src_collection.find({}, no_cursor_timeout=True, session=session)
+                validate_documents(model, docs)
+
+    async def validate_src(self, job_manager=None, model_file=None, **kwargs):
+        """Validate the source data using the Pydantic model"""
+        try:
+            if not self.validation_dir:
+                raise ValueError("No validation directory found for uploader source '%s'", self.fullname)
+
+            # check if user has provided a model file if not use the default model file
+            if model_file:
+                self.logger.info("Using provided model file: %s", model_file)
+                model_path = os.path.join(self.validation_dir, f"{model_file}")
+            elif self.validation_model:
+                self.logger.info(
+                    "No model file provided, using default model file provided from uploader: %s", self.validation_model
+                )
+                model_path = os.path.join(self.validation_dir, f"{self.validation_model}")
+            else:
+                self.logger.info("No model file provided, using default model file: %s", f"{self.name}_model.py")
+                model_path = os.path.join(self.validation_dir, f"{self.name}_model.py")
+
+        except Exception as e:
+            self.logger.error(
+                "Error importing Pydantic model for uploader source '%s'. Make sure you have committed a valid pydantic model.",
+                self.fullname,
+            )
+            raise e
+
+        try:
+            assert job_manager, "Job manager is required for validation"
+            self.prepare()
+            pinfo = self.get_pinfo()
+            pinfo["step"] = "validate_src"
+
+            extra = {"model_file": "/hub" + model_path.split("/hub", 1)[1]}
+            self.register_status("validating", subkey="validate", **extra)
+            job = await job_manager.defer_to_process(pinfo, partial(self.validate, model_path, **kwargs))
+            await job
+
+            self.register_status("success", subkey="validate", err=None, tb=None, **extra)
+        except Exception as e:
+            self.logger.exception("failed validation: %s" % e, extra={"notify": True})
+            import traceback
+
+            self.logger.error(traceback.format_exc())
+            self.register_status("failed", subkey="validate", err=str(e), tb=traceback.format_exc(), **extra)
+            raise
+
+
+class AssistedUploader:
+    DATA_PLUGIN_FOLDER = None
+
 
 class NoBatchIgnoreDuplicatedSourceUploader(BaseSourceUploader):
-    '''Same as default uploader, but will store records and ignore if
+    """Same as default uploader, but will store records and ignore if
     any duplicated error occuring (use with caution...). Storage
     is done line by line (slow, not using a batch) but preserve order
     of data in input file.
-    '''
+    """
+
     storage_class = NoBatchIgnoreDuplicatedStorage
 
 
 class IgnoreDuplicatedSourceUploader(BaseSourceUploader):
-    '''Same as default uploader, but will store records and ignore if
+    """Same as default uploader, but will store records and ignore if
     any duplicated error occuring (use with caution...). Storage
     is done using batch and unordered bulk operations.
-    '''
+    """
+
     storage_class = IgnoreDuplicatedStorage
 
 
 class MergerSourceUploader(BaseSourceUploader):
-
     storage_class = MergerStorage
 
 
@@ -581,32 +618,31 @@ class DummySourceUploader(BaseSourceUploader):
     def prepare_src_dump(self):
         src_dump = get_src_dump()
         # just populate/initiate an src_dump record (b/c no dump before) if needed
-        self.src_doc = src_dump.find_one({'_id': self.main_source})
+        self.src_doc = src_dump.find_one({"_id": self.main_source})
         if not self.src_doc:
             src_dump.save({"_id": self.main_source})
-            self.src_doc = src_dump.find_one({'_id': self.main_source})
+            self.src_doc = src_dump.find_one({"_id": self.main_source})
         return src_dump
 
     def check_ready(self, force=False):
         # bypass checks about src_dump
         pass
 
-    @asyncio.coroutine
-    def update_data(self, batch_size, job_manager=None, release=None):
+    async def update_data(self, batch_size, job_manager=None, release=None, **kwargs):
         assert release is not None, "Dummy uploader requires 'release' argument to be specified"
         self.logger.info("Dummy uploader, nothing to upload")
         # dummy uploaders have no dumper associated b/c it's collection-only resource,
         # so fill minimum information so register_status() can set the proper release
-        self.src_dump.update_one({'_id': self.main_source},
-                                 {"$set": {
-                                     "download.release": release
-                                 }})
+        self.src_dump.update_one({"_id": self.main_source}, {"$set": {"download.release": release}})
         # sanity check, dummy uploader, yes, but make sure data is there
-        assert self.collection.count(
-        ) > 0, "No data found in collection '%s' !!!" % self.collection_name
+        assert self.collection.count() > 0, "No data found in collection '%s' " % self.collection_name
 
 
 class ParallelizedSourceUploader(BaseSourceUploader):
+
+    # Max parallel uploads allowed. If None, no limit.
+    MAX_PARALLEL_UPLOAD = None
+
     def jobs(self):
         """Return list of (`*arguments`) passed to self.load_data, in order. for
         each parallelized jobs. Ex: [(x,1),(y,2),(z,3)]
@@ -614,71 +650,63 @@ class ParallelizedSourceUploader(BaseSourceUploader):
         """
         raise NotImplementedError("implement me in subclass")
 
-    @asyncio.coroutine
-    def update_data(self, batch_size, job_manager=None):
-        jobs = []
+    async def update_data(self, batch_size, job_manager=None, **kwargs):
+        max_upload = self.__class__.MAX_PARALLEL_UPLOAD and asyncio.Semaphore(self.__class__.MAX_PARALLEL_UPLOAD)
         job_params = self.jobs()
-        got_error = False
-        # make sure we don't use any of self reference in the following loop
-        fullname = copy.deepcopy(self.fullname)
-        storage_class = copy.deepcopy(self.__class__.storage_class)
-        load_data = copy.deepcopy(self.load_data)
-        temp_collection_name = copy.deepcopy(self.temp_collection_name)
-        self.unprepare()
-        # important: within this loop, "self" should never be used to make sure we don't
-        # instantiate unpicklable attributes (via via autoset attributes, see prepare())
-        # because there could a race condition where an error would cause self to log a statement
-        # (logger is unpicklable) while at the same another job from the loop would be
-        # subtmitted to job_manager causing a error due to that logger attribute)
-        # in other words: once unprepared, self should never be changed until all
-        # jobs are submitted
-        for bnum, args in enumerate(job_params):
-            pinfo = self.get_pinfo()
-            pinfo["step"] = "update_data"
-            pinfo["description"] = "%s" % str(args)
-            job = yield from job_manager.defer_to_process(
-                pinfo,
-                partial(
-                    # pickable worker
-                    upload_worker,
-                    # worker name
-                    fullname,
-                    # storage class
-                    storage_class,
-                    # loading func
-                    load_data,
-                    # dest collection name
-                    temp_collection_name,
-                    # batch size
-                    batch_size,
-                    # batch num
-                    bnum,
-                    # and finally *args passed to loading func
-                    *args))
-            jobs.append(job)
+        fullname = self.fullname
+        storage_class = self.__class__.storage_class
+        load_data = self.load_data
+        temp_collection_name = self.temp_collection_name
 
-            # raise error as soon as we know
-            if got_error:
-                raise got_error
+        async def batch_uploaded(job, name, batch_num):
+            try:
+                res = await job
+            finally:
+                if max_upload:
+                    max_upload.release()
+            if not isinstance(res, int):
+                raise Exception("Batch #%s failed while uploading source '%s' [%s]" % (batch_num, name, res))
 
-            def batch_uploaded(f, name, batch_num):
-                # important: don't even use "self" ref here to make sure jobs can be submitted
-                # (see comment above, before loop)
-                nonlocal got_error
-                try:
-                    if type(f.result()) != int:
-                        got_error = Exception(
-                            "Batch #%s failed while uploading source '%s' [%s]"
-                            % (batch_num, name, f.result()))
-                except Exception as e:
-                    got_error = e
+        submitted = False
+        try:
+            # TaskGroup raises errors as soon as we get them, cancelling the
+            # submission loop and remaining downloads:
+            # 1. it prevents from launching things for nothing
+            # 2. if we gathered errors at the end of the loop *and* if we
+            #    had more errors than the queue size, we'd get stuck
+            async with asyncio.TaskGroup() as tg:
+                for batch_number, args in enumerate(job_params):
+                    pinfo = self.get_pinfo()
+                    pinfo["step"] = "update_data"
+                    pinfo["description"] = "%s" % str(args)
 
-            job.add_done_callback(
-                partial(batch_uploaded, name=fullname, batch_num=bnum))
-        if jobs:
-            yield from asyncio.gather(*jobs)
-            if got_error:
-                raise got_error
+                    if max_upload:
+                        await max_upload.acquire()
+
+                    upload_worker_db = kwargs.get("db", None)
+                    max_batch_num = kwargs.get("max_batch_num", None)
+
+                    job = await job_manager.defer_to_process(
+                        pinfo,
+                        partial(
+                            upload_worker,  # pickable worker
+                            fullname,  # worker name
+                            storage_class,  # storage class
+                            load_data,  # loading function
+                            temp_collection_name,  # destination collection name
+                            batch_size,  # batch size
+                            batch_number,  # batch number
+                            *args,  # loading function arguments
+                            db=upload_worker_db,
+                            max_batch_num=max_batch_num,
+                        ),
+                    )
+                    tg.create_task(batch_uploaded(job, fullname, batch_number))
+                    submitted = True
+        except* Exception as eg:
+            raise first_exception(eg) from eg
+
+        if submitted:
             self.switch_collection()
             self.clean_archived_collections()
 
@@ -690,23 +718,20 @@ class NoDataSourceUploader(BaseSourceUploader):
     It's usefull for instance when mapping need to be stored (get_mapping())
     but data doesn't comes from an actual upload (ie. generated)
     """
+
     storage_class = NoStorage
 
-    @asyncio.coroutine
-    def update_data(self, batch_size, job_manager=None):
+    async def update_data(self, batch_size, job_manager=None):
         self.logger.debug("No data to upload, skip")
 
 
 class UploaderManager(BaseSourceManager):
-    '''
+    """
     After registering datasources, manager will orchestrate source uploading.
-    '''
+    """
 
     SOURCE_CLASS = BaseSourceUploader
-
-    def __init__(self, poll_schedule=None, *args, **kwargs):
-        super(UploaderManager, self).__init__(*args, **kwargs)
-        self.poll_schedule = poll_schedule
+    # VALIDATIONS = getattr(config, "UPLOAD_VALIDATIONS", {})
 
     def get_source_ids(self):
         """Return displayable list of registered source names (not private)"""
@@ -715,12 +740,22 @@ class UploaderManager(BaseSourceManager):
         # and considered internal (note: while there could be more than 1 uploader per source, when it's
         # an autoupdate one, there's only one, so [0])
         from biothings.hub.autoupdate.uploader import BiothingsUploader  # prevent circular imports
-        registered = sorted([src for src, klasses in self.register.items() if not src.startswith("__")
-                             and not issubclass(klasses[0], BiothingsUploader)])
+
+        registered = sorted(
+            [
+                src
+                for src, klasses in self.register.items()
+                if not src.startswith("__") and not issubclass(klasses[0], BiothingsUploader)
+            ]
+        )
         return registered
 
     def __repr__(self):
-        return "<%s [%d registered]: %s>" % (self.__class__.__name__, len(self.register), self.get_source_ids())
+        return "<%s [%d registered]: %s>" % (
+            self.__class__.__name__,
+            len(self.register),
+            self.get_source_ids(),
+        )
 
     def clean_stale_status(self):
         src_dump = get_src_dump()
@@ -730,9 +765,7 @@ class UploaderManager(BaseSourceManager):
             dirty = False
             for subsrc in jobs:
                 if jobs[subsrc].get("status") == "uploading":
-                    logging.warning(
-                        "Found stale datasource '%s', marking upload status as 'canceled'"
-                        % src["_id"])
+                    logging.warning("Found stale datasource '%s', marking upload status as 'canceled'", src["_id"])
                     jobs[subsrc]["status"] = "canceled"
                     dirty = True
             if dirty:
@@ -747,8 +780,18 @@ class UploaderManager(BaseSourceManager):
         else:
             return klass
 
-    def create_instance(self, klass):
-        inst = klass.create(db_conn_info=self.conn.address)
+    def create_instance(self, klass, database_address: str = None):
+        """
+        Create an uploader class instance with the provided uploaded class instance
+        and optional database address.
+
+        If database address is not provided then we attempt to load it from the UploaderManager
+        instance.
+        """
+        if database_address is None:
+            database_address = self.conn.address
+
+        inst = klass.create(db_conn_info=database_address, validation_dir=self.get_validation_path(klass))
         return inst
 
     def register_classes(self, klasses):
@@ -770,7 +813,7 @@ class UploaderManager(BaseSourceManager):
             jobs.extend(job)
         return asyncio.gather(*jobs)
 
-    def upload_src(self, src, *args, **kwargs):
+    def upload_src(self, src, validate=False, *args, **kwargs):
         """
         Trigger upload for registered resource named 'src'.
         Other args are passed to uploader's load() method
@@ -778,48 +821,83 @@ class UploaderManager(BaseSourceManager):
         try:
             klasses = self[src]
         except KeyError:
-            raise ResourceNotFound(
-                "Can't find '%s' in registered sources (whether as main or sub-source)"
-                % src)
+            raise ResourceNotFound(f"Can't find '{src}' in registered sources (whether as main or sub-source)")
 
         jobs = []
         try:
-            for i, klass in enumerate(klasses):
+            for _, klass in enumerate(klasses):
+                kwargs["job_manager"] = self.job_manager
                 job = self.job_manager.submit(
-                    partial(self.create_and_load,
-                            klass,
-                            job_manager=self.job_manager,
-                            *args,
-                            **kwargs))
+                    # partial(self.create_and_load, klass, job_manager=self.job_manager, *args, **kwargs)
+                    partial(self.create_and_load, klass, validate, *args, **kwargs)  # Fix Flake8 B026
+                )
                 jobs.append(job)
-            tasks = asyncio.gather(*jobs)
 
-            def done(f):
+            async def all_done():
                 try:
-                    # just consume the result to raise exception
-                    # if there were an error... (what an api...)
-                    f.result()
+                    await asyncio.gather(*jobs)
                     logging.info("success", extra={"notify": True})
                 except Exception as e:
                     logging.exception("failed: %s" % e, extra={"notify": True})
 
-            tasks.add_done_callback(done)
+            self.job_manager.loop.create_task(all_done())
             return jobs
         except Exception as e:
-            logging.exception("Error while uploading '%s': %s" % (src, e),
-                              extra={"notify": True})
+            logging.exception("Error while uploading '%s': %s" % (src, e), extra={"notify": True})
             raise
 
-    @asyncio.coroutine
-    def create_and_load(self, klass, *args, **kwargs):
+    def update_source_meta(self, src, dry=False):
+        """
+        Trigger update for registered resource named 'src'.
+        """
+        try:
+            klasses = self[src]
+        except KeyError:
+            raise ResourceNotFound(f"Can't find '{src}' in registered sources (whether as main or sub-source)" % src)
+
+        jobs = []
+        try:
+            for _, klass in enumerate(klasses):
+                job = self.job_manager.submit(partial(self.create_and_update_master, klass, dry=dry))
+                jobs.append(job)
+
+            async def all_done():
+                try:
+                    await asyncio.gather(*jobs)
+                    logging.info("success", extra={"notify": True})
+                except Exception as e:
+                    logging.exception("failed: %s" % e, extra={"notify": True})
+
+            self.job_manager.loop.create_task(all_done())
+            return jobs
+        except Exception as e:
+            logging.exception("Error while update src meta '%s': %s" % (src, e), extra={"notify": True})
+            raise
+
+    async def create_and_update_master(self, klass, dry=False):
+        compare_data = None
+        inst = self.create_instance(klass)
+        inst.prepare()
+        if dry:
+            compare_data = inst.get_current_and_new_master()
+        else:
+            inst.update_master()
+        return compare_data
+
+    async def create_and_load(self, klass, validate=False, *args, **kwargs):
         insts = self.create_instance(klass)
-        if type(insts) != list:
+        if not isinstance(insts, list):
             insts = [insts]
         for inst in insts:
-            yield from inst.load(*args, **kwargs)
+            await inst.load(*args, **kwargs)
+
+        # if validate or f"{inspect.getmodule(klass).__name__}.{klass.__name__}" in self.VALIDATIONS:
+        for inst in insts:
+            if validate or inst.auto_validate:
+                await inst.validate_src(*args, **kwargs)
 
     def poll(self, state, func):
-        super(UploaderManager, self).poll(state, func, col=get_src_dump())
+        super().poll(state, func, col=get_src_dump())
 
     def source_info(self, source=None):
         src_dump = get_src_dump()
@@ -840,12 +918,14 @@ class UploaderManager(BaseSourceManager):
             for uploader in uploaders:
                 upl = {
                     "name": "%s.%s" % (inspect.getmodule(uploader).__name__, uploader.__name__),
-                    "bases": ["%s.%s" % (inspect.getmodule(k).__name__, k.__name__) for k in uploader.__bases__
-                              if inspect.getmodule(k)],
+                    "bases": [
+                        "%s.%s" % (inspect.getmodule(k).__name__, k.__name__)
+                        for k in uploader.__bases__
+                        if inspect.getmodule(k)
+                    ],
                     "dummy": issubclass(uploader, DummySourceUploader),
                 }
-                src["upload"].setdefault("jobs",
-                                         {}).setdefault(uploader.name, {})
+                src["upload"].setdefault("jobs", {}).setdefault(uploader.name, {})
                 src["upload"]["jobs"][uploader.name]["uploader"] = upl
             src["name"] = _id
             src["_id"] = _id
@@ -865,6 +945,45 @@ class UploaderManager(BaseSourceManager):
         for name, klasses in self.register.items():
             res[name] = [klass.__name__ for klass in klasses]
         return res
+
+    def get_validation_path(self, klass):
+        module_name = inspect.getmodule(klass).__name__
+        spec = importlib.util.find_spec(module_name)
+        if spec and spec.origin:
+            module_path = os.path.dirname(spec.origin)
+        else:
+            raise ImportError(f"Module '{module_name}' not found")
+        return os.path.join(module_path, "validation")
+
+    async def create_and_validate(self, klass, *args, **kwargs):
+        inst = self.create_instance(klass)
+        await inst.validate_src(*args, **kwargs)
+
+    def validate_src(self, src, *args, **kwargs):
+        try:
+            klasses = self[src]
+        except KeyError:
+            raise ResourceNotFound(f"Can't find '{src}' in registered sources (whether as main or sub-source)")
+        jobs = []
+        try:
+            for _, klass in enumerate(klasses):
+                logging.info("Creating Pydantic Validation Task for '%s'" % src)
+                kwargs["job_manager"] = self.job_manager
+                job = self.job_manager.submit(partial(self.create_and_validate, klass, *args, **kwargs))
+                jobs.append(job)
+
+            async def all_done():
+                try:
+                    await asyncio.gather(*jobs)
+                    logging.info("success", extra={"notify": True})
+                except Exception as e:
+                    logging.exception("failed: %s" % e, extra={"notify": True})
+
+            self.job_manager.loop.create_task(all_done())
+            return jobs
+        except Exception as e:
+            logging.exception("Error while validating '%s': %s" % src, e, extra={"notify": True})
+            raise
 
 
 def set_pending_to_upload(src_name):

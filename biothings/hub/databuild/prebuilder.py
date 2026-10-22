@@ -1,6 +1,7 @@
+import pymongo
+
 import biothings.utils.redis as redis
 from biothings.utils.mongo import doc_feeder
-import pymongo
 
 
 class BasePreCompiledDataProvider(object):
@@ -41,7 +42,7 @@ class RedisPreCompiledDataProvider(BasePreCompiledDataProvider):
 
     def get_all(self):
         for _id in self.db.scan_iter():
-            #cols = list(self.db.hgetall(_id).keys())
+            # cols = list(self.db.hgetall(_id).keys())
             cols = []
             yield (_id, cols)
 
@@ -57,10 +58,11 @@ class MongoDBPreCompiledDataProvider(BasePreCompiledDataProvider):
     def register(self, _id, col_name):
         updt = {"$set": {"srcs.%s" % col_name: 1}}
         if type(_id) == list:
-            bob = self.col.initialize_unordered_bulk_op()
+            bulk = []
             for oneid in _id:
-                bob.find({"_id": oneid}).upsert().update(updt)
-            bob.execute()
+                bulk.append(pymongo.UpdateOne(filter={"_id": oneid}, update=updt, upsert=True))
+            if bulk:
+                self.col.bulk_write(bulk, ordered=False)
         else:
             self.col.update_one({"_id": _id}, updt, upsert=True)
 

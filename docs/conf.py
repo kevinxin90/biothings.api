@@ -16,10 +16,12 @@
 
 
 # -- Project information -----------------------------------------------------
+import datetime
 
-project = 'BioThings SDK'
-copyright = '2020, BioThings'
-author = 'BioThings team'
+current_year = datetime.datetime.now().year
+project = "BioThings SDK"
+copyright = f"{current_year}, BioThings"
+author = "BioThings team"
 
 
 # -- General configuration ---------------------------------------------------
@@ -28,19 +30,20 @@ author = 'BioThings team'
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
 extensions = [
-    'sphinx.ext.autodoc',
-    'sphinx.ext.viewcode',
-    'sphinx.ext.napoleon',   # support numpy and google style docstring
-    'sphinx_reredirects'     # handle old page redirection see "redirects" setting below
+    "sphinx.ext.autodoc",
+    "sphinx.ext.viewcode",
+    "sphinx.ext.napoleon",  # support numpy and google style docstring
+    "sphinx_reredirects",  # handle old page redirection see "redirects" setting below
+    "sphinx_rtd_theme",  # standard readthedocs theme
 ]
 
 # Add any paths that contain templates here, relative to this directory.
-templates_path = ['_templates']
+templates_path = ["_templates"]
 
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
 # This pattern also affects html_static_path and html_extra_path.
-exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 
 
 # -- Options for HTML output -------------------------------------------------
@@ -53,31 +56,30 @@ exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".
-html_static_path = ['_static']
+html_static_path = ["_static"]
 
+html_theme = "sphinx_rtd_theme"
 
-# on_rtd is whether we are on readthedocs.org
-import os
-on_rtd = os.environ.get('READTHEDOCS', None) == 'True'
+# # on_rtd is whether we are on readthedocs.org
+# import os
+# on_rtd = os.environ.get("READTHEDOCS", None) == "True"
 
-if not on_rtd:
-    # only import and set the theme if we're building docs locally
-    try:
-        import sphinx_rtd_theme
-        html_theme = 'sphinx_rtd_theme'
-        html_theme_path = [sphinx_rtd_theme.get_html_theme_path()]
-    except ImportError:
-        print('Warning: "sphinx_rtd_theme" is not installed, fall back to default theme.')
-# otherwise, readthedocs.org uses their theme by default, so no need to specify it
+# if not on_rtd:
+#     # only import and set the theme if we're building docs locally
+#     try:
+#         import sphinx_rtd_theme
 
+#         html_theme = "sphinx_rtd_theme"
+#         html_theme_path = [sphinx_rtd_theme.get_html_theme_path()]
+#     except ImportError:
+#         print('Warning: "sphinx_rtd_theme" is not installed, fall back to default theme.')
+# # otherwise, readthedocs.org uses their theme by default, so no need to specify it
 
 # Both the class’ and the __init__ method’s docstring are concatenated and inserted.
 # Ref: http://www.sphinx-doc.org/en/master/usage/extensions/autodoc.html#confval-autoclass_content
-autoclass_content = 'both'
+autoclass_content = "both"
 
-redirects = {
-    "doc/studio": "../tutorial/studio.html"
-}
+redirects = {"doc/studio": "../tutorial/studio.html"}
 
 # Reference Code
 # ---------------------
@@ -96,5 +98,19 @@ redirects = {
 
 # this allows "import config" or "from biothings import config"
 #  to work without actually creating a config.py file
-# sys.modules["config"] = DummyConfig()
-# sys.modules["biothings.config"] = DummyConfig()
+
+import sys
+
+from biothings.utils.common import DummyConfig
+
+config_mod = DummyConfig(name="config")
+config_mod.HUB_DB_BACKEND = {
+    "module": "biothings.utils.sqlite3",
+    "sqlite_db_folder": ".biothings_hub",
+}
+config_mod.DATA_SRC_DATABASE = ".data_src_database"
+config_mod.DATA_ARCHIVE_ROOT = ".biothings_hub/archive"
+config_mod.LOG_FOLDER = ".biothings_hub/logs"
+
+sys.modules["config"] = config_mod
+sys.modules["biothings.config"] = config_mod

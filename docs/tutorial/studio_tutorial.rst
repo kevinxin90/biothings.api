@@ -1,5 +1,5 @@
 ********
-Tutorial
+A. Tutorial
 ********
 
 This tutorial will guide you through **BioThings Studio** by showing, in a first part, how to convert a simple flat file
@@ -7,16 +7,15 @@ to a fully operational BioThings API. In a second part, this API will enrich for
 
 .. note:: You may also want to read the `developer's guide <studio_guide.html>`_ for more detailed informations.
 
-.. note:: The following tutorial is only valid for **BioThings Studio** release **0.2b**. Check
-   all available `releases <https://github.com/biothings/biothings_studio/releases>`_ for more.
+.. note:: The following tutorial uses a docker-compose file to run the **BioThings Studio** and **Hub**. This file is available `here <https://github.com/biothings/biothings_docker>`_
 
 =================
-What you'll learn
+1. What you'll learn
 =================
 
 Through this guide, you'll learn:
 
-* how to obtain a Docker image to run your favorite API
+* how to run a docker-compose to run your favorite API
 * how to run that image inside a Docker container and how to access the **BioThings Studio** application
 * how to integrate a new data source by defining a data plugin
 * how to define a build configuration and create data releases
@@ -25,18 +24,13 @@ Through this guide, you'll learn:
 
 
 =============
-Prerequisites
+2. Prerequisites
 =============
 
 Using **BioThings Studio** requires a Docker server up and running, some basic knowledge
-about commands to run and use containers. Images have been tested on Docker >=17. Using AWS cloud,
-you can use our public AMI **biothings_demo_docker** (``ami-44865e3c`` in Oregon region) with Docker pre-configured
-and ready for studio deployment. Instance type depends on the size of data you
-want to integrate and parsers' performances. For this tutorial, we recommend using instance type with at least
-4GiB RAM, such as ``t2.medium``. AMI comes with an extra 30GiB EBS volume, which is more than enough
-for the scope of this tutorial.
+about commands to run and use containers. Images have been tested on Docker >=17.
 
-Alternately, you can install your own Docker server (on recent Ubuntu systems, ``sudo apt-get install docker.io``
+You can install your own Docker server (on recent Ubuntu systems, ``sudo apt-get install docker.io``
 is usually enough). You may need to point Docker images directory to a specific hard drive to get enough space,
 using ``-g`` option:
 
@@ -47,82 +41,65 @@ using ``-g`` option:
   # restart to make this change active
   sudo service docker restart
 
+Alternatively, if you have a Mac or Windows, you can install `Docker Desktop <https://www.docker.com/products/docker-desktop>`_.
+It will install the docker server for you. Once you have Docker Desktop installed, go to settings->resources->advanced. You should give at least 80% of your resources to Docker for each category.
+This will prevent your Docker from crashing if you are running a large datasource or build.
 
 ============
-Installation
+3. Installation
 ============
 
-**BioThings Studio** is available as a Docker image that you can pull from our BioThings Docker Hub repository:
-
-.. code:: bash
-
-  $ docker pull biothings/biothings-studio:0.2b
+**BioThings Studio** is available as a docker-compose file at our `github repository <https://github.com/biothings/biothings_docker/>`_.
+Clone the repository to your local.
 
 A **BioThings Studio** instance exposes several services on different ports:
 
 * **8080**: **BioThings Studio** web application port
-* **7022**: **BioThings Hub** SSH port
 * **7080**: **BioThings Hub** REST API port
 * **7081**: **BioThings Hub** REST API port, read-only access
 * **9200**: ElasticSearch port
 * **27017**: MongoDB port
 * **8000**: BioThings API, once created, it can be any non-priviledged (>1024) port
 * **9000**: `Cerebro <https://github.com/lmenezes/cerebro>`_, a webapp used to easily interact with ElasticSearch clusters
-* **60080**: `Code-Server <https://github.com/cdr/code-server>`_, a webapp used to directly edit code in the container
 
-We will map and expose those ports to the host server using option ``-p`` so we can access BioThings services without
-having to enter the container:
+.. note:: Ports 8080, 7080, 9200, 27017, 8000, 9000 are exposed by default in the docker-compose.yml file.
+
+.. warning:: Review these port mappings before starting: for access from the Docker host only, replace
+   mappings such as ``7080:7080`` with ``127.0.0.1:7080:7080``, and remove the ones you don't need.
+   See :doc:`hub_deployment` for remote access and for requiring a login.
 
 .. code:: bash
 
-  $ docker run --rm --name studio -p 8080:8080 -p 7022:7022 -p 7080:7080 -p 7081:7081 -p 9200:9200 \
-    -p 27017:27017 -p 8000:8000 -p 9000:9000 -p 60080:60080 -d biothings/biothings-studio:0.2b
-
-.. note:: we need to add the release number after the image name: biothings-studio:**0.2b**. Should you use another release (including unstable releases,
-   tagged as ``master``) you would need to adjust this parameter accordingly.
-
-.. note:: Biothings Studio and the Hub are not designed to be publicly accessible. Those ports should **not** be exposed. When
-   accessing the Studio and any of these ports, SSH tunneling can be used to safely access the services from outside.
-   Ex: ``ssh -L 7080:localhost:7080 -L 8080:localhost:8080 -L 7022:localhost:7022 -L 9000:localhost:9000 user@mydockerserver`` will expose the Hub REST API, the web application,
-   the Hub SSH, and Cerebro app ports to your computer, so you can access the webapp using http://localhost:8080, the Hub REST API using http://localhost:7080,
-   http://localhost:9000 for Cerebro, and directly type ``ssh -p 7022 biothings@localhost`` to access Hub's internals via the console.
-   See https://www.howtogeek.com/168145/how-to-use-ssh-tunneling for more details.
+  $ docker compose up -d --build
 
 We can follow the starting sequence using ``docker logs`` command:
 
 .. code:: bash
 
-  $ docker logs -f studio
-  Waiting for mongo
-  tcp        0      0 127.0.0.1:27017         0.0.0.0:*               LISTEN      -
-  * Starting Elasticsearch Server
-  ...
-  Waiting for cerebro
-  ...
-  now run webapp
-  not interactive
+  $ docker logs -f biothings
+   ARG
+   SSH keys not yet created, creating
+   Generating SSH Keys for BioThings Hub...
+   SSH Key has been generated, Public Key:
 
 Please refer to `Filesystem overview <studio_guide.html#filesystem-overview>`_ and  `Services check <studio_guide.html#services-check>`_ for
 more details about Studio's internals.
 
-By default, the studio will auto-update its source code to the latest version available and install all required dependencies. This behavior can be skipped
-by adding ``no-update`` at the end of the command line of ``docker run ...``.
-
 We can now access **BioThings Studio** using the dedicated web application (see `webapp overview <studio_guide.html#overview-of-biothings-studio-web-application>`_).
 
 
-=========================
-Part 1: single datasource
-=========================
+===================================
+4. Getting start with data plugin
+===================================
 
 In this section we'll dive in more details on using the **BioThings Studio** and **Hub**. We will be integrating a simple flat file as a new datasource
 within the **Hub**, declare a build configuration using that datasource, create a build from that configuration, then a data release and finally instantiate a new API service
 and use it to query our data.
 
-The whole source code is available at https://github.com/sirloon/pharmgkb, each branch pointing to a specific step in this tutorial.
+The whole source code is available at https://github.com/biothings/tutorials/tree/master, each branch pointing to a specific step in this tutorial.
 
-Input data
-^^^^^^^^^^
+4.1. Input data
+^^^^^^^^^^^^^^^
 
 For this tutorial, we will use several input files provided by `PharmGKB <https://www.pharmgkb.org/>`_,
 freely available in their `download <https://www.pharmgkb.org/downloads>`_ section, under "Annotation data":
@@ -137,12 +114,15 @@ The last two files will be used in the second part of this tutorial when we'll a
 .. _`drugLabels.zip`: https://s3.pgkb.org/data/drugLabels.zip
 .. _`occurrences.zip`: https://s3.pgkb.org/data/occurrences.zip
 
-Parser
-^^^^^^
+These files will be downloaded by the **Hub** when we trigger the dumper. These files will go into a folder named ``data_folder`` by default.
+This will be explained in more detail in the `Data Plugin <studio.html#id1>`_ section.
+
+4.2. Parser
+^^^^^^^^^^^
 
 In order to ingest this data and make it available as an API, we first need to write a parser. Data is pretty simple, tab-separated files, and we'll
 make it even simpler by using ``pandas`` python library. The first version of this parser is available in branch ``pharmgkb_v1`` at
-https://github.com/sirloon/pharmgkb/blob/pharmgkb_v1/parser.py. After some boilerplate code at the beginning for dependencies and initialization,
+https://github.com/biothings/tutorials/blob/pharmgkb_v1/parser.py. After some boilerplate code at the beginning for dependencies and initialization,
 the main logic is the following:
 
 
@@ -178,6 +158,10 @@ containing the downloaded data. This path is automatically set by the Hub and po
 
 It is the responsibility of the parser to select, within that folder, the file(s) of interest. Here we need data from a file named ``var_drug_ann.tsv``.
 Following the moto "don't assume it, prove it", we make that file exists.
+
+.. note:: In this case, an assertion isn't necessary as code will fail anyway if the file doesn't exist. But it's a good practice to make sure
+   the file exists before trying to open it. Also, it's a good practice to use ``os.path.join()`` to build the path to the file, as it will
+   automatically use the right path separator depending on the operating system.
 
 .. code:: python
 
@@ -224,16 +208,20 @@ in a dictionary indexed by gene ID. The final documents are assembled in the las
         yield doc
 
 
-.. note:: The `_id` key is mandatory and represents a unique identifier for this document. The type must be a string. The _id key is
+.. note:: The `_id` key is mandatory and represents a unique identifier for this document. The type must be a string. The `_id` key is
    used when data from multiple datasources are merged together, that process is done according to its value
-   (all documents sharing the same _id from different datasources will be merged together).
+   (all documents sharing the same `_id` from different datasources will be merged together). Due to the `indexing limitation <https://www.elastic.co/guide/en/elasticsearch/reference/8.4/mapping-id-field.html>`_, the length of
+   the `_id` key should be kept no more than 512.
 
 .. note:: In this specific example, we read the whole content of this input file in memory, then store annotations per gene. The data itself
    is small enough to do this, but memory usage always needs to be cautiously considered when we write a parser.
 
+.. note:: In this case, the final documents are assembled within a generator function, which is a good practice to save memory.
+   You may see within our `Biothings github organization <https://github.com/biothings>`_ that we have plugins where we return a dictonary or a list of documents.
+   This is also fine, but it is recommended to use a generator function when possible.
 
-Data plugin
-^^^^^^^^^^^
+4.3. Data plugin
+^^^^^^^^^^^^^^^^
 
 Parser is ready, it's now time to glue everything together and build our API. We can easily create a new datasource and integrate data using
 **BioThings Studio**, by declaring a `data plugin`. Such plugin is defined by:
@@ -251,7 +239,7 @@ that contains everything useful for the datasource. This is what we'll do in the
    so we don't have to regurlarly update the plugin code (``git pull``) from the webapp, to fetch the latest code. That said, since the plugin
    is already defined in github in our case, we'll use the github repo registration method.
 
-The corresponding data plugin repository can be found at https://github.com/sirloon/pharmgkb/tree/pharmgkb_v1. The manifest file looks like this:
+The corresponding data plugin repository can be found at https://github.com/biothings/tutorials/tree/pharmgkb_v1. The manifest file looks like this:
 
 .. code:: bash
 
@@ -312,15 +300,12 @@ reconnect, which we'll do!
 .. image:: ../_static/hub_restarting.png
    :width: 250px
 
-The Hub shows an error though:
+Once you reconnect, you will have to do a hard refresh on your webpage, for example, ``cmd + shift + r`` on a Mac or ``ctrl + shift + r`` on a Windows/Linux.
 
-.. image:: ../_static/nomanifest.png
-   :width: 250px
-
-Indeed, we fetch source code from branch ``master``, which doesn't contain any manifest file. We need to switch to another branch (this tutorial is organized using branches,
+Since we fetch source code from branch ``master``, which doesn't contain any manifest file. We need to switch to another branch (this tutorial is organized using branches,
 and also it's a perfect opportunity to learn how to use a specific branch/commit using **BioThings Studio**...)
 
-Let's click on ``pharmgkb`` link, then |plugin|. In the textbox on the right, enter ``pharmgkb_v1`` then click on ``Update``.
+Let's click on ``tutorials`` link, then |plugin|. In the textbox on the right, enter ``pharmgkb_v1`` then click on ``Update``.
 
 .. |plugin| image:: ../_static/plugin.png
    :width: 70px
@@ -330,6 +315,8 @@ Let's click on ``pharmgkb`` link, then |plugin|. In the textbox on the right, en
 
 **BioThings Studio** will fetch the corresponding branch (we could also have specified a commit hash for instance), source code changes will be detected and the Hub will restart.
 The new code version is now visible in the plugin tab
+
+.. note:: Remember to do a hard refresh again before continuing as the hub will attempt to restart.
 
 .. image:: ../_static/branch.png
    :width: 400px
@@ -363,7 +350,7 @@ we've run 3 commands to register the plugin, dump the data and upload the JSON d
 .. image:: ../_static/allcommands.png
    :width: 450px
 
-We also have new notifications as shown by the red number on the right. Let's have a quick look:
+We also have new notifications as shown by the speakerphone icon number on the left. Let's have a quick look:
 
 .. image:: ../_static/allnotifs.png
    :width: 450px
@@ -374,14 +361,14 @@ release number, the data folder, when the last download was, how long it tooks t
 .. image:: ../_static/dumptab.png
    :width: 450px
 
-Same for the `Uploader` tab, we now have 979 documents uploaded to MongoDB.
+Same for the `Uploader` tab, we now have 979 documents uploaded to MongoDB. Exact number may change depending on when the source file that is downloaded.
 
 .. image:: ../_static/uploadtab.png
    :width: 450px
 
 
-Inspection and mapping
-^^^^^^^^^^^^^^^^^^^^^^
+4.4. Inspection and mapping
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Now that we have integrated a new datasource, we can move forward. Ultimately, data will be sent to ElasticSearch, an indexing engine.
 In order to do so, we need to tell ElasticSearch how the data is structured and which fields should be indexed (and which should not).
@@ -428,7 +415,7 @@ Since the collection is very small, inspection is fast. But... it seems like we 
 This result means documents sometimes have ``notes`` key equal to ``NaN``, and sometimes equal to a string (a splittable string, meaning there are spaces in it).
 This is a problem for ElasticSearch because it wouldn't index the data properly. And furthermore, ElasticSearch doesn't allow ``NaN`` values anyway. So we need
 to fix the parser. The fixed version is available in branch ``pharmgkb_v2`` (go back to Plugin tab, enter that branch name and update the code).
-The fix consists in `removing key/value <https://github.com/sirloon/pharmgkb/blob/pharmgkb_v2/parser.py#L24>`_ from the records, whenever a value is equal to ``NaN``.
+The fix consists in `removing key/value <https://github.com/biothings/tutorials/blob/pharmgkb_v2/parser.py#L32>`_ from the records, whenever a value is equal to ``NaN``.
 
 .. code:: python
 
@@ -471,7 +458,7 @@ moving forwared, we want to make sure the mapping is valid, let's click on |vali
 
 Everything looks fine, the last step is to "commit" the mapping, meaning we're ok to use this mapping as the official, registered mapping that will actually be used by ElasticSearch. Indeed the left side of the page is about inspected mapping, we can re-launch the
 inspection as many times as we want, without impacting active/registered mapping (this is usefull when the data structure changes). Click on
-|commit| then "OK", and you now should see the final, registered mapping on the right:
+|commit| then "YES", and you now should see the final, registered mapping on the right:
 
 .. |commit| image:: ../_static/commit.png
    :width: 75px
@@ -479,8 +466,8 @@ inspection as many times as we want, without impacting active/registered mapping
 .. image:: ../_static/registered.png
    :width: 450px
 
-Build
-^^^^^
+4.5. Build
+^^^^^^^^^^
 
 Once we have integrated data and a valid ElasticSearch mapping, we can move forward by creating a build configuration. A `build configuration`
 tells the **Hub** which datasources should be merged together, and how. Click on |builds| then |menu| and finally, click on |newbuildconf|.
@@ -497,10 +484,10 @@ tells the **Hub** which datasources should be merged together, and how. Click on
 * the `document type` represents the kind of documents stored in the merged collection. It gives its name to the annotate API endpoint (eg. /gene). This source
   is about gene annotations, so "gene" it is...
 * open the dropdown list and select the `sources` you want to be part of the merge. We only have one, "pharmgkb"
-* in `root sources`, we can declare which sources are allowed to create new documents in the merged collection, that is merge documents from a
-  datasource, but only if corresponding documents exist in the merged collection. It's useful if data from a specific source relates to data on
-  another source (it only makes sense to merge that relating data if the data itself is present). If root sources are declared, **Hub** will first
-  merge them, then the others. In our case, we can leave it empty (no root sources specified, all sources can create documents in the merged collection)
+* in `root sources`, we can declare which sources are allowed to create new documents in the merged collection.
+  If a root source is declared, data from other sources will only be merged if documents previously exist with same IDs (documents coming from root sources).
+  If not, data is discarded. Finally, if no root source is declared, any data sources can generate a new document in the merged data.
+  In our case, we can leave it empty (no root sources specified, all sources can create documents in the merged collection).
 * selecting a builder is optional, but for the sake of this tutorial, we'll choose ``LinkDataBuilder``. This special builder will fetch documents directly from
   our datasources `pharmgkb` when indexing documents, instead of duplicating documents into another connection (called `target` or `merged` collection). We can
   do this (and save time and disk space) because we only have one datasource here.
@@ -523,8 +510,8 @@ You can give a specific name for that build, or let the **Hub** generate one for
 
 Open it by clicking on its name. You can explore the tabs for more information about it (sources involved, build times, etc...). The "Release" tab is the one we're going to use next.
 
-Data release
-^^^^^^^^^^^^
+4.6. Data release
+^^^^^^^^^^^^^^^^^
 
 If not there yet, open the new created build and go the "Release" tab. This is the place where we can create new data releases. Click on |newrelease|.
 
@@ -563,8 +550,8 @@ Clicking on an index gives access to different information, such as the mapping,
    :width: 100%
 
 
-API creation
-^^^^^^^^^^^^
+4.7. API creation
+^^^^^^^^^^^^^^^^^
 
 At this stage, a new index containing our data has been created on ElasticSearch, it is now time for final step. Click on |api| then |menu| and finally |newapi|
 
@@ -600,8 +587,8 @@ can be accessed:
    means nothing outside of Docker's context. In order to use the API you may need to replace this hostname by the one actually used to access the
    Docker instance.
 
-Tests
-^^^^^
+4.8. Tests
+^^^^^^^^^^
 
 Assuming API is accessible through http://localhost:8000, we can easily query it with ``curl`` for instance. The endpoint ``/metadata`` gives
 information about the datasources and build date:
@@ -703,8 +690,20 @@ Finally, we can fetch a variant by its PharmGKB ID:
   }
 
 
-Conclusions
-^^^^^^^^^^^
+Most of the time, the API testing is not necessary. Unless you are specifically testing out a custom api feature.
+You can learn more about customizing api web components in the `Biothings Web <web.html>`_. In our use case, you can just query the Elasticsearch instance directly.
+In this example, we will be using `postman <https://www.postman.com/>`_, to query the Elasticsearch Index.
+Once you have postman installed you can make this query ``http://localhost:9200/MY_BUILD_NAME/_search``. Check a few of the hits to make sure if your parser has correctly formatted the data.
+You can also make more detailed search queries in the elasticsearch index if needed.
+
+
+
+.. image:: ../_static/postman.png
+   :width: 600px
+
+
+4.9. Conclusions
+^^^^^^^^^^^^^^^^^
 
 We've been able to easily convert a remote flat file to a fully operational BioThings API:
 
@@ -717,29 +716,37 @@ We've been able to easily convert a remote flat file to a fully operational BioT
 
 The next step is to enrich that existing API with more datasources.
 
-============================
-Part 2: multiple datasources
-============================
+4.10. Multiple sources data plugin
+^^^^^^^^^^^^^^^^^^^^^^^^^
 
 In the previous part, we generated an API from a single flat file. This API serves data about gene annotations, but we need more: as mentioned earlier in **Input data**,
-we also downloaded drug labels and publications information. Integrating those unused files, we'll be able to enrich our API even more, that's the goal of this second part.
+we also downloaded drug labels and publications information. Integrating those unused files, we'll be able to enrich our API even more, that's the goal of this part.
 
-Data plugin limitations
-^^^^^^^^^^^^^^^^^^^^^^^
+In our case, we have one *dumper* responsible for downloading three different files, and we now need three different *uploaders* in order to process these files. With above data plugin (4.3), only one file is parsed. In order to proceed
+further, we need to specify multiple *uploaders* on the *manifest.json* file, the full example can be found in branch ``pharmgkb_v5`` available at https://github.com/biothings/tutorials/tree/pharmgkb_v5.
+
+.. note:: You can learn more about data plugin in the section **B.4. Data plugin architecture and specifications**
+
+======================
+5. Regular data source
+======================
+
+5.1. Data plugin limitations
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 The **data plugin architecture** provided by **BioThings Studio** allows to quickly integrate a new datasource, describing where the data is located, and how the data should be parsed.
-It provides a simple and generic way to do so, but also comes with some limitations. Indeed, only one *uploader* can be specificed. In our case, we have one *dumper* responsible for
-downloading three different files, and we now need three different *uploaders* in order to process these files. With our data plugin, only one file is parsed. In order to proceed
-further, we need to manually write dumper and uploaders code...
-
-.. note:: We could also process all three files in one single parser, that is, one single uploder, but for the sake of this tutorial, we'll proceed individually. Files can also
-   be updated at different times, keeping uploaders separated helps maintaining data up-to-date without having to process all files at once each time.
+It provides a simple and generic way to do so, but also comes with some limitations. Indeed, in many advanced use cases, you need to use a custom data builder instead of `LinkDataBuilder` (that you used at the point 4.5). But you can not define a custom builder on the data plugin.
 
 Luckily, **BioThings Studio** provides an easy to export python code that has been generated during data plugin registration. Indeed, code is generated from the manifest file, compiled
 and injected into **Hub**'s memory. Exporting the code consists in writing down that dynamically generated code.
+After successful export,we have a new folder stays in `hub/dataload/sources` and contains exported python files - that is a **Regular data source** (or a regular dumper/uploader based data sources)
+Following below steps, you will learn about how to deal with a regular data source.
 
-Code export
-^^^^^^^^^^^
+
+5.2. Code export
+^^^^^^^^^^^^^^^^
+
+.. note:: You MUST to update above `pharmgkb` data plugin to the version `pharmgkb_v2`.
 
 Let's go back to our datasource, **Plugin** tab. Clicking on |exportcode| brings the following form:
 
@@ -776,34 +783,34 @@ Let's delete the plugin, by clicking on |trash|, and confirm the deletion.
 .. |trash| image:: ../_static/trash.png
    :width: 30px
 
-**Hub** will restart again (reload page if not) and this time, our datasource is active. If we click on ``pharmgkb``, we'll see the same details as before except the ``Plugin`` tab which
+**Hub** will restart again (reload page if not) and this time, our datasource is active. If we click on ``tutorials``, we'll see the same details as before except the ``Plugin`` tab which
 disappeared. So far, our exported code runs, and we're in the exact same state as before, the **Hub** even kept our previously dumped/uploaded data.
 
 Let's explore the source code that has been generated through out this process. Let's enter our docker container, and become user ``biothings`` (from which everything runs):
 
 .. code:: bash
 
-  $ docker exec -ti studio /bin/bash
+  $ docker exec -ti biothings /bin/bash
   $ sudo su - biothings
 
 Paths provided as export results (``hub/dataload/sources/*``) are relative to the started folder named ``biothings_studio``. Let's move there:
 
 .. code:: bash
 
-  $ cd biothings_studio/hub/dataload/sources/
+  $ cd ~/biothings_studio/hub/dataload/sources/
   $ ls -la
   total 0
   -rw-rw-r-- 1 biothings biothings   0 Jan 15 23:41 __init__.py
   drwxrwxr-x 2 biothings biothings  45 Jan 15 23:41 __pycache__
   drwxr-xr-x 1 biothings biothings  75 Jan 15 23:41 ..
   drwxr-xr-x 1 biothings biothings  76 Jan 22 19:32 .
-  drwxrwxr-x 3 biothings biothings 154 Jan 22 19:32 pharmgkb
+  drwxrwxr-x 3 biothings biothings 154 Jan 22 19:32 tutorials
 
-A ``pharmgkb`` folder can be found and contains the exported code:
+A ``tutorials`` folder can be found and contains the exported code:
 
 .. code:: bash
 
-  $ cd pharmgkb
+  $ cd tutorials
   $ ls
   total 32
   drwxrwxr-x 3 biothings biothings   154 Jan 22 19:32 .
@@ -816,26 +823,26 @@ A ``pharmgkb`` folder can be found and contains the exported code:
   -rw-rw-r-- 1 biothings biothings  1190 Jan 22 19:32 parser.py
   -rw-rw-r-- 1 biothings biothings  2334 Jan 22 19:32 upload.py
 
-Some files were copied from data plugin repository (``LICENCE``, ``README`` and ``parser.py``), the others are the exported ones:  ``dump.py`` for the dumper, ``upload.py``
+Some files were copied from data plugin repository (``LICENSE``, ``README`` and ``parser.py``), the others are the exported ones:  ``dump.py`` for the dumper, ``upload.py``
 for the uploader and the mappings, and ``__init__.py`` so the **Hub** can find these components upon start. We'll go in further details later, specially when we'll add more
 uploaders.
 
-For conveniency, the exported code can be found in branch ``pharmgkb_v3`` available at https://github.com/sirloon/pharmgkb/tree/pharmgkb_v3. One easy way to follow
-this tutorial without having to type too much is to replace folder ``pharmgkb`` with a clone from Git repository. The checked out code is exactly the same as code after export.
+For conveniency, the exported code can be found in branch ``pharmgkb_v3`` available at https://github.com/biothings/tutorials/tree/pharmgkb_v3. One easy way to follow
+this tutorial without having to type too much is to replace folder ``tutorials`` with a clone from Git repository. The checked out code is exactly the same as code after export.
 
 .. code:: bash
 
   $ cd ~/biothings_studio/hub/dataload/sources/
-  $ rm -fr pharmgkb
-  $ git clone https://github.com/sirloon/pharmgkb.git
-  $ cd pharmgkb
+  $ rm -fr tutorials
+  $ git clone https://github.com/biothings/tutorials.git
+  $ cd tutorials
   $ git checkout pharmgkb_v3
 
 
-More uploaders
+5.3. More uploaders
 ^^^^^^^^^^^^^^
 
-Now that we have exported the code, we can start the modifications. The final code can be found on branch https://github.com/sirloon/pharmgkb/tree/pharmgkb_v4.
+Now that we have exported the code, we can start the modifications. The final code can be found on branch https://github.com/biothings/tutorials/tree/pharmgkb_v4.
 
 .. note:: We can directly point to that branch using ``git checkout pharmgkb_v4`` within the datasource folder previously explored.
 
@@ -856,7 +863,6 @@ Next is about defining new uploaders. In ``upload.py``, we currently have one up
       name = "pharmgkb"
       __metadata__ = {"src_meta": {}}
       idconverter = None
-      storage_class = biothings.hub.dataload.storage.BasicStorage
   ...
 
 The important pieces of information here is ``name``, which gives the name of the uploader we define. Currently uploader is named ``pharmgkb``.
@@ -886,7 +892,6 @@ As a result, we now have:
 
     main_source = "pharmgkb"
     name = "druglabels"
-    storage_class = biothings.hub.dataload.storage.BasicStorage
 
     def load_data(self, data_folder):
         self.logger.info("Load data from directory: '%s'" % data_folder)
@@ -909,7 +914,6 @@ As a result, we now have:
 
       main_source = "pharmgkb"
       name = "occurrences"
-      storage_class = biothings.hub.dataload.storage.BasicStorage
 
       def load_data(self, data_folder):
           self.logger.info("Load data from directory: '%s'" % data_folder)
@@ -944,7 +948,7 @@ If we look at the other uploader tabs, we don't see much information, that's bec
 After a while, all uploaders have run, data is populated, as shown in the different tabs.
 
 
-More data inspection
+5.4. More data inspection
 ^^^^^^^^^^^^^^^^^^^^
 
 Data is ready, it's now time to inspect the data for the new uploaders. Indeed, if we check the "Mapping" tab, we still have the old mapping from the original ``pharmgkb`` uploader
@@ -955,7 +959,7 @@ let's fix that by click on |inspectlabelicon|. After few seconds, mappings are g
 each tab.
 
 
-Modifying build configuration
+5.5. Modifying build configuration
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 All data is now ready, as well as mappings, it's time to move forward and build the merged data. We now have three differents source for documents, and we need to merge them
@@ -976,7 +980,7 @@ There several parameters we need to adjust:
   merge the other sources **only** if a document from ``annotations`` with the same _id exists. If not, documents are silently ignored.
 * finally, we were previously using a ``LinkDataBuilder`` because we only had one datasource (data wasn't copied, but refered, or linked to the original datasource collection). We now
   have three datasources involved in the merge so we can't use that builder anymore and need to switch to the default ``DataBuilder`` one. If not, **Hub** will complain and deactivate
-  the build configuration until it's fixed.
+  the build configuration until it's fixed. Since we already had a previous build, we want to specify an incremental build ``diff``.
 
 The next configuration is summarized in the following picture:
 
@@ -985,7 +989,7 @@ The next configuration is summarized in the following picture:
 
 Upon validation, build configuration is ready to be used.
 
-Incremental release
+5.6. Incremental release
 ^^^^^^^^^^^^^^^^^^^
 
 Configuration reflects our changes and is up-to-date, let's create a new build. Click on |menu| if not already open, then "Create a new build"
@@ -1049,7 +1053,7 @@ also from the notification popups when it's done.
 Our index, currently served by our API defined in the part 1, has been updated, using a diff, or incremental, release. It's time to have a look at the data.
 
 
-Testing final API
+5.7. Testing final API
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Because we directly apply a diff, or patch our data, on ElasticSearch index, we don't need to re-create an API. Querying the API should just transparently reflect that "live" update.
@@ -1150,7 +1154,7 @@ Let's query by symbol name, just as before:
 
 We new have much information associated (much have been remove for clarity), including keys ``drug_labels`` and ``occurrences`` coming the two new uploaders.
 
-Conclusions
+5.8. Conclusions
 ^^^^^^^^^^^
 
 Moving from a single datasource based API, previously defined as a data plugin, we've been able to export this data plugin code. This code was used as a base
@@ -1163,18 +1167,184 @@ to extend our API, specifically:
 So far APIs are running from within **BioThings Studio**, and data still isn't exposed to the public. The next step to publish this data and make the API available
 for everyone.
 
-.. note:: **BioThings Studio** is a backend service, aimed to be used internally to prepare, test and release APIs. It is not inteneded to be facing public internet, in other words,
-   it's not recommended to expose any ports, including API ports, to public-facing internet.
+.. note:: **BioThings Studio** is a backend service for preparing, testing, and releasing APIs
+   in a trusted administrative environment. Keep its administrative services and databases
+   off the public internet. Deploy the query API for its intended data consumers with
+   separate access rules, as described in :doc:`hub_deployment`.
+
+
+===============
+6. Data Plugins
+===============
+
+In our last section, we learned how to create a **Regular Data Source**.
+Now that we have learned how to dynamically generate code for our plugin, we can discuss the different classes that we can use for our dumpers.
+Using these classes, we can have an easier time creating dumpers to fit our needs when downloading different types of data on the interweb.
+Here is a short summary of some of the important classes that you may typically use.
+
+* APIDumper: This will run API calls in a clean process and write its results in one or more NDJSON documents.
+* DockerContainerDumper:  Starts a docker container (typically runs on a different server) to prepare the data file on the remote container,
+  and then download this file to the local data source folder.
+* LastModifiedFTPDumper: SRC_URLS containing a list of URLs pointing to files to download, uses FTP's MDTM command to check whether files should be downloaded.
+* LastModifiedHTTPDumper: Given a list of URLs, check Last-Modified header to see whether the file should be downloaded.
+
+All of data plugin types can all be reviewed in our biothings.api on github https://github.com/biothings/biothings.api/blob/master/biothings/hub/dataload/dumper.py.
+
+
+6.1. DockerContainer Plugin
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. note:: For this section, you will need to know how to use our Biothings CLI, as our docker compose is not built to handle this type of plugin.
+   Please refer back to our Biothings CLI tutorial before starting this section.
+
+The DockerContainer plugin allows us to remotely start and control a docker container from another server, using our Biothings Hub.
+Using another server to run the bulk process of our dumper can have many different use cases. For example, if we are using a public api
+to create a source, we may need to call their api multiple times for testing. This may inadvertantly cause an accidental ban. Even
+if we follow their rate limiting, the api may flag our IP address as a bot. By using another server, we can minimize this issue by setting
+a different IP address separate from the Scripps Network, so if there is a ban it only be contained to our one server instead of our whole network.
+
+The steps to the DockerContainerDumper Plugin look like this:
+
+* It boots up a container from provided parameters: image, tag, container_name.
+* Runs the dump_command inside this container. This command MUST block the dumper until the data file is completely prepared.
+  This will guarantee that the remote file is ready for downloading.
+* Optional: runs the get_version_cmd inside this container. Set this command out put as self.release.
+* Download the remote file via Docker API, extract the downloaded .tar file.
+* When the downloading is complete:
+   * if keep_container=false: Remove the above container after.
+   * if keep_container=true: leave this container running.
+* If there are any errors during the data dump, the remote container and volumes won't be removed.
+
+There are additional parameters that can also be added. All of them will be listed here with a short summary,
+but we will not be using all of the parameters for this tutorial:
+
+* image: (Optional) the Docker image name
+* tag: (Optional) the image tag
+* container_name: (Required) Boots up an existing container. If the container does not exist, it will create a new container using the image and tag parameters.
+* volumes: (Optional) Used specifally for local bind mounts. If used without a named_volume, the volume will not automatically be removed once the data finishes dumping.
+* named_volumes: (Optional) Creates a named volume to be removed when the data finishes dumping.
+* path: (Required) path to the remote file inside the Docker container.
+* dump_command: (Required) This command will be run inside the Docker container in order to create the remote file.
+* keep_container: (Optional) accepted values: true/false, default: false.
+   * If keep_container=true, the remote container will be persisted.
+   * If keep_container=false, the remote container will be removed in the end of dump step.
+* get_version_cmd: (Optional) The custom command for checking release version of local and remote file.
+
+
+Now we will need to clone the tutorial onto your local computer and switch to pharmgkb_v7.
+
+.. code:: bash
+
+   git clone https://github.com/biothings/tutorials.git
+   cd tutorials
+   git checkout pharmgkb_v7
+
+Now we will need to install the requirements to run our Biothings CLI. We will first create a virtual environment and then install a Biothings Hub dev environemt.
+
+.. code:: bash
+
+   python -m venv .venv
+   source ./venv/bin/activate
+   pip install "biothings[dev]"
+
+Just like our original pharmgkb plugin, we have a manifest and a parser file with the new addition of a Dockerfile.
+Lets have a quick look at the manifest file.
+
+.. code:: yaml
+
+   version: '0.3'
+   name: 'tutorials'
+   requires:
+   - pandas
+   - numpy
+   dumper:
+      data_url:
+         - docker://localhost?image=annotations&tag=latest
+      #  - docker://localhost?container_name=mytest2&image=annotations&tag=latest&path=/tmp/annotations.zip&exec_command="/usr/bin/wget https://s3.pgkb.org/data/annotations.zip -O /tmp/annotations.zip"&keep_container=false"
+      #  - docker://localhost?image=annotations&tag=latest&path=/tmp/annotations.zip&exec_command="/usr/bin/wget https://s3.pgkb.org/data/annotations.zip -O /tmp/annotations.zip"&keep_container=false&get_version_cmd="md5sum {} | awk '{ print $1 }'"
+      #  - docker://localhost?container_name=<YOUR CONTAINER NAME>&path=/tmp/annotations.zip&exec_command="/usr/bin/wget https://s3.pgkb.org/data/annotations.zip -O /tmp/annotations.zip"&keep_container=true&get_version_cmd="md5sum {} | awk '{ print $1 }'"
+   uncompress: true
+   uploader:
+   parser: parser:load_annotations
+   on_duplicates: error
+
+.. note::
+   If you notice, the manifest file is in a yaml format while the previous manifest files have all been in a json format. This is because our Hub can parse both yaml and json formatted files!
+
+As you can see, the manifest file is in a very similar format as the manifest file in our Data Plugin <studio.html#id1>`_ section.
+The only difference is we have included a new data_url section within the dumper.
+The data_url should match the following format:
+
+``docker://CONNECTION_NAME?image=DOCKER_IMAGE&tag=TAG&path=/path/to/remote_file&dump_command="this is custom command"&container_name=CONTAINER_NAME&keep_container=true&get_version_cmd="cmd"&volumes=VOLUMES&named_volumes=NAMED_VOLUMES``
+
+There seems to be an issue though looking at our listed parameters, the dump_command, path, and countainer_name are all required, but they seem to be missing from the data_url.
+Lets try to dump using this manifest file to see what happens!
+
+Lets first build our docker file. As shown in our manifest, the data url has ``image=annotations`` so when we build we have to make sure to name our image accordingly.
+
+.. code:: bash
+
+   docker build -t annotations .
+
+Now we can finally test our source using the Biothings CLI. Since our document size is small we can directly use the dump_and_upload.
+If you are working with a larger source you will need need to use them separately and specify the ``--batch-limit`` flag when uploading:
+
+.. code:: bash
+
+   biothings-cli dataplugin dump_and_upload
+
+We have now successfully dumped and uploaded our source. Why did we not see any of the expected errors for missing parameters?
+
+.. image:: ../_static/clidumpupload.png
+   :width: 500px
+
+To answer this question, we have to take a look at the Dockerfile.
+
+.. code::
+
+   FROM praqma/network-multitool:latest
+   LABEL "path"="/tmp/annotations.zip"
+   LABEL "dump_command"="/usr/bin/wget https://s3.pgkb.org/data/annotations.zip -O /tmp/annotations.zip"
+   LABEL keep_container="true"
+   LABEL container_name=tutorials
+
+To keep the data url from becoming too difficult to read, we can directly set the paramters into a Docker **LABEL** object.
+This is why we are able to run the dump and upload process without encountering any errors.
+A new directory has been created by the CLI. Lets take a look at it.
+
+.. image:: ../_static/biothingshub.png
+   :width: 500px
+
+Within the ``.biothings_hub/archive/tutorials/2024-01-17T23:42:38Z`` directory, there is an annotations.zip that was dumped along with the uncompressed contents
+that we specified in the manifest. Since we did not specify a version, the current datetime is automatically used for the directory name ``.biothings_hub/archive/tutorials/2024-01-17T23:42:38Z``
+The ``.biothings_hub/biothings_hubdb`` and ``.biothings_hub/.data_src_database`` are both sqlite databases that
+hold the information that would normally be held in the mongodb. The former being the datasource settings and
+the latter holding our uploaded data.
+
+With our uploaded data in our database, we can finally serve this data on our localhost.
+
+.. code:: bash
+
+   biothings-cli dataplugin serve
+
+The result should look something similar to this:
+
+.. image:: ../_static/datapluginserve.png
+   :width: 500px
+
+Congratulations you have learned how to build a Docker based plugin!
+Remember to make sure to always test out some of the queries before submitting your plugin.
+
 
 =========================================
-Part 3: API cloud deployments and hosting
+1. API cloud deployments and hosting
 =========================================
 
 This part is still under development... Stay tuned and join Biothings Google Groups (https://groups.google.com/forum/#!forum/biothings) for more.
 
 
 ===============
-Troubleshooting
+8. Troubleshooting
 ===============
 
 We test and make sure, as much as we can, that the **BioThings Studio** image is up-to-date and running properly. But things can still go wrong...
@@ -1196,7 +1366,7 @@ be useful to troubleshoot an issue. Typing ``help()``, or even passing a command
 
 On a lower level, make sure all services are running in the docker container. Enter the container with
 ``docker exec -ti studio /bin/bash`` and type ``netstat -tnlp``, you should see services running on ports
-(see usual running `services <studio_guide.html#services-check>`_). If services on ports 7080 and 7022 aren't running, it means the
+(see usual running `services <studio_guide.html#services-check>`_). If the service on port 7080 isn't running, it means the
 **Hub** has not started. If you just started the instance, wait a little more as services may take a while
 before they're fully started and ready.
 

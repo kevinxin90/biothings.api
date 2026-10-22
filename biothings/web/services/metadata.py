@@ -1,19 +1,22 @@
-import asyncio
-import logging
 from collections import defaultdict
 from datetime import datetime
 from functools import reduce
 from operator import add
+from typing import Dict, Union
+import asyncio
+import logging
 
-import elasticsearch
+
 from dateutil.parser import parse as dtparse
+from elasticsearch import AsyncElasticsearch, Elasticsearch
+
+from biothings.utils.common import get_loop
 
 logger = logging.getLogger(__name__)
 
+
 class BiothingsMetadata:
-
     def __init__(self):
-
         # cached, generated from mappings
         self.biothing_metadata = defaultdict(dict)
         # {
@@ -43,6 +46,8 @@ class BiothingsMetadata:
         #         'chebi': 'http://bit.ly/2KAUCAm', ... }
         #     "gene": { ... }
         # }
+        self.biothing_exists_aliases = defaultdict(dict)
+        # Maps each biothing type to {object field: subfield} aliases.
 
     def get_metadata(self, biothing_type):  # hub
         return self.biothing_metadata[biothing_type]
@@ -53,12 +58,15 @@ class BiothingsMetadata:
     def get_licenses(self, biothing_type):
         return self.biothing_licenses[biothing_type]
 
+    def get_exists_aliases(self, biothing_type):
+        return self.biothing_exists_aliases[biothing_type]
+
     async def refresh(self, biothing_type):
         pass
 
-class BiothingsESMetadata(BiothingsMetadata):
 
-    def __init__(self, indices, client):
+class BiothingsESMetadata(BiothingsMetadata):
+    def __init__(self, indices: Dict, client: Union[AsyncElasticsearch, Elasticsearch]):
         super().__init__()
 
         if not indices:
@@ -72,7 +80,7 @@ class BiothingsESMetadata(BiothingsMetadata):
         self.client = client
 
         # initial refresh
-        loop = asyncio.get_event_loop()
+        loop = get_loop()
         for btype in self.indices:
             obj = self.refresh(btype)
             if asyncio.iscoroutine(obj):
@@ -86,7 +94,7 @@ class BiothingsESMetadata(BiothingsMetadata):
     def types(self):  # biothing_type(s)
         return tuple(filter(None, self.indices.keys()))
 
-    def update(self, biothing_type, info, count):
+    def update(self, biothing_type: str, info, count):
         """
         Read ES index mappings for the corresponding biothing_type,
         Populate datasource info and field properties from mappings.
@@ -102,33 +110,35 @@ class BiothingsESMetadata(BiothingsMetadata):
                     break
 
         reader = _BiothingsESMetadataReader(_type, info, count)
+        logger.debug(reader)
         self.biothing_metadata[biothing_type] = reader.get_metadata()
         self.biothing_mappings[biothing_type] = reader.get_mappings()
         self.biothing_licenses[biothing_type] = reader.get_licenses()
+        self.biothing_exists_aliases[biothing_type] = reader.get_exists_aliases()
 
-    def refresh(self, biothing_type=None):
-        from elasticsearch import AsyncElasticsearch, Elasticsearch
+    def refresh(self, biothing_type: str = None):
+
         if isinstance(self.client, Elasticsearch):
             return self._refresh(biothing_type)
         elif isinstance(self.client, AsyncElasticsearch):
             return self._async_refresh(biothing_type)
 
-    def _refresh(self, biothing_type):
+    def _refresh(self, biothing_type: str):
         index = self.indices[biothing_type]
         info = self.client.indices.get(index=index)
         count = self.client.count(index=index)
         self.update(biothing_type, info, count)
         return info
 
-    async def _async_refresh(self, biothing_type):
+    async def _async_refresh(self, biothing_type: str):
         index = self.indices[biothing_type]
         info = await self.client.indices.get(index=index)
         count = await self.client.count(index=index)
         self.update(biothing_type, info, count)
         return info
 
-class BiothingsMongoMetadata(BiothingsMetadata):
 
+class BiothingsMongoMetadata(BiothingsMetadata):
     def __init__(self, collections, client):
         super().__init__()
 
@@ -144,8 +154,7 @@ class BiothingsMongoMetadata(BiothingsMetadata):
         # https://pymongo.readthedocs.io/en/stable/api/pymongo/collection.html
         # #pymongo.collection.Collection.estimated_document_count
         self.biothing_metadata[biothing_type] = BiothingHubMeta(
-            biothing_type=biothing_type,
-            stats=dict(total=collection.estimated_document_count())
+            biothing_type=biothing_type, stats=dict(total=collection.estimated_document_count())
         ).to_dict()
 
     def get_mappings(self, biothing_type):
@@ -159,8 +168,8 @@ class BiothingsMongoMetadata(BiothingsMetadata):
         # rely on metadata storage support
         return {}
 
-class BiothingsSQLMetadata(BiothingsMetadata):
 
+class BiothingsSQLMetadata(BiothingsMetadata):
     def __init__(self, tables, client):
         super().__init__()
 
@@ -180,12 +189,10 @@ class BiothingsSQLMetadata(BiothingsMetadata):
         cursor = self.client.execute(f"SELECT * FROM {table}")
         if cursor.returns_rows:
             self.biothing_mappings[biothing_type] = {
-                key: {'type': type(val).__name__}
-                for key, val in zip(cursor.keys(), cursor.fetchone())
+                key: {"type": type(val).__name__} for key, val in zip(cursor.keys(), cursor.fetchone())
             }
             self.biothing_metadata[biothing_type] = BiothingHubMeta(
-                biothing_type=biothing_type,
-                stats=dict(total=cursor.rowcount)
+                biothing_type=biothing_type, stats=dict(total=cursor.rowcount)
             ).to_dict()
 
 
@@ -197,15 +204,20 @@ class _BiothingsESMetadataReader:
     If the pattern matches no index, then empty dictionaries are returned.
     """
 
-    def __init__(self, biothing_type, info, count):
-
+    def __init__(self, biothing_type: str, info, count):
         self.biothing_type = biothing_type
         self.document_count = count
 
-        self.indices_info = {
-            index: _ESIndex(biothing_type, **index_info)
-            for index, index_info in info.items()
-        }
+        self.indices_info = {index: _ESIndex(biothing_type, **index_info) for index, index_info in info.items()}
+
+    def __repr__(self) -> str:
+        """
+        BiothingsESMetadataReader textual representation
+        """
+        object_repr = (
+            f"{self.__class__}[{id(self)}] " f"| type: {self.biothing_type} " f"| indices: {self.indices_info}"
+        )
+        return object_repr
 
     def get_mappings(self):
         """
@@ -237,6 +249,24 @@ class _BiothingsESMetadataReader:
         licenses = reduce(add, licenses).to_dict() if licenses else {}
         return licenses
 
+    def get_exists_aliases(self):
+        """
+        Return aliases shared by all indices that map the object field.
+
+        Indices without that field do not affect alias selection.
+        """
+        per_index = [(info.mappings, info.get_exists_aliases().aliases) for info in self.indices_info.values()]
+
+        candidates = {}
+        for _, aliases in per_index:
+            candidates.update(aliases)
+
+        return {
+            field: alias
+            for field, alias in candidates.items()
+            if all(aliases.get(field) == alias or not mapping.has_field(field) for mapping, aliases in per_index)
+        }
+
     def get_metadata(self):
         """
         Provide description about the data under this type. Example:
@@ -251,12 +281,13 @@ class _BiothingsESMetadataReader:
         metadata = list(info.get_metadata() for info in self.indices_info.values())
         metadata = reduce(add, metadata).to_dict() if metadata else {}
         if metadata:
-            if metadata.get('biothing_type') == "__multiple__":
-                metadata['biothing_type'] = self.biothing_type
-            metadata['stats']['total'] = self.document_count['count']
-        metadata['_biothing'] = self.biothing_type
-        metadata['_indices'] = list(self.indices_info.keys())
+            if metadata.get("biothing_type") == "__multiple__":
+                metadata["biothing_type"] = self.biothing_type
+            metadata["stats"]["total"] = self.document_count["count"]
+        metadata["_biothing"] = self.biothing_type
+        metadata["_indices"] = list(self.indices_info.keys())
         return metadata
+
 
 class _ESIndex:
     """
@@ -286,18 +317,18 @@ class _ESIndex:
             build_date=self.settings.get_creation_date().isoformat(),
             build_version=self.settings.get_index_version(),
             src={},
-            stats={}
+            stats={},
         )
 
     def get_licenses(self):
-        return BiothingLicenses(
-            self.mappings.extract_licenses()
-        )
+        return BiothingLicenses(self.mappings.extract_licenses())
+
+    def get_exists_aliases(self):
+        return BiothingExistsAliases(self.mappings.extract_exists_aliases())
 
     def get_mappings(self):
-        return BiothingMappings(
-            self.mappings.properties
-        )
+        return BiothingMappings(self.mappings.properties)
+
 
 class _ESIndexSettings:
     """
@@ -319,15 +350,16 @@ class _ESIndexSettings:
     """
 
     def __init__(self, setting):
-        self.index = setting['index']
+        self.index = setting["index"]
 
     def get_creation_date(self):
-        return datetime.fromtimestamp(int(self.index['creation_date'])/1000)
+        return datetime.fromtimestamp(int(self.index["creation_date"]) / 1000)
 
     def get_index_version(self):
-        if 'updated' in self.index['version']:
-            return self.index['version']['updated']
-        return self.index['version']['created']
+        if "updated" in self.index["version"]:
+            return self.index["version"]["updated"]
+        return self.index["version"]["created"]
+
 
 class _ESIndexMappings:
     """
@@ -349,27 +381,72 @@ class _ESIndexMappings:
         # for elasticsearch version 6.x
         if len(mapping) == 1 and next(iter(mapping)) != "properties":
             # remove doc_type, support 1 type per index
-            mapping = next(iter(mapping.values()))
-        self.enabled = mapping.pop('enabled', True)
-        self.dynamic = mapping.pop('dynamic', True)
-        self.properties = mapping.get('properties', {})
-        self.metadata = mapping.get('_meta', {})
+            # mapping in ES6 is nested under doc_type
+            # we will try to take the mapping dict under the first doc_type
+            _mapping = next(iter(mapping.values()))
+            if isinstance(_mapping, dict) and "properties" in _mapping:
+                mapping = _mapping
+        self.enabled = mapping.pop("enabled", True)
+        self.dynamic = mapping.pop("dynamic", True)
+        self.properties = mapping.get("properties", {})
+        self.metadata = mapping.get("_meta", {})
 
     def extract_licenses(self):
         """
         Return source name - license url pairs.
         """
         licenses = {}
-        for src, info in self.metadata.get('src', {}).items():
-            if 'license_url_short' in info:
-                licenses[src] = info['license_url_short']
-            elif 'license_url' in info:
-                licenses[src] = info['license_url']
+        for src, info in self.metadata.get("src", {}).items():
+            if "license_url_short" in info:
+                licenses[src] = info["license_url_short"]
+            elif "license_url" in info:
+                licenses[src] = info["license_url"]
         return licenses
+
+    def _resolve(self, path):
+        """Return the mapping for a dotted field path, or None if absent."""
+        spec = {"properties": self.properties}
+        for part in path.split("."):
+            properties = spec.get("properties") if isinstance(spec, dict) else None
+            if not isinstance(properties, dict) or part not in properties:
+                return None
+            spec = properties[part]
+        return spec if isinstance(spec, dict) else None
+
+    def has_field(self, path):
+        """Return whether the dotted field path exists in the mapping."""
+        return self._resolve(path) is not None
+
+    def extract_exists_aliases(self):
+        """
+        Return aliases whose object and descendant field exist in the mapping.
+
+        This checks field paths, not whether their document counts still match.
+        """
+        aliases = self.metadata.get("exists_field_aliases") or {}
+        if not isinstance(aliases, dict):
+            logger.warning("Ignoring malformed '_meta.exists_field_aliases': %s", aliases)
+            return {}
+
+        verified = {}
+        for field, alias in aliases.items():
+            if not isinstance(field, str) or not isinstance(alias, str):
+                continue
+            if not alias.startswith(f"{field}."):
+                logger.warning("Ignoring _exists_ alias '%s' -> '%s': not a subfield of it", field, alias)
+                continue
+            field_spec = self._resolve(field)
+            if field_spec is None or "properties" not in field_spec:
+                logger.warning("Ignoring _exists_ alias for '%s': not an object field in this index", field)
+                continue
+            if self._resolve(alias) is None:
+                logger.warning("Ignoring _exists_ alias '%s' -> '%s': target not in this index", field, alias)
+                continue
+            verified[field] = alias
+        return verified
 
 
 class BiothingMetaProp:
-
     def __add__(self, other):
         raise NotImplementedError
 
@@ -381,8 +458,8 @@ class BiothingMetaProp:
     def to_dict(self):
         raise NotImplementedError
 
-class BiothingLicenses(BiothingMetaProp):
 
+class BiothingLicenses(BiothingMetaProp):
     def __init__(self, licenses):
         self.licenses = licenses
 
@@ -394,8 +471,16 @@ class BiothingLicenses(BiothingMetaProp):
     def to_dict(self):
         return dict(self.licenses)
 
-class BiothingMappings(BiothingMetaProp):
 
+class BiothingExistsAliases(BiothingMetaProp):
+    def __init__(self, aliases):
+        self.aliases = aliases
+
+    def to_dict(self):
+        return dict(self.aliases)
+
+
+class BiothingMappings(BiothingMetaProp):
     def __init__(self, properties):
         self.properties = properties
 
@@ -407,49 +492,46 @@ class BiothingMappings(BiothingMetaProp):
     def to_dict(self):
         return dict(self.properties)
 
+
 class BiothingHubMeta(BiothingMetaProp):
-
     def __init__(self, **metadata):  # dict
-
-        self.biothing_type = metadata.get('biothing_type')
+        self.biothing_type = metadata.get("biothing_type")
         # self.build_date = datetime.fromisoformat(metadata['build_date']) # python3.7 syntax
         # self.build_date = datetime.strptime(metadata['build_date'], "%Y-%m-%dT%H:%M:%S.%f")
-        self.build_date = metadata.get('build_date')
-        self.build_version = metadata.get('build_version')
-        self.src = metadata.get('src', {})
-        self.stats = metadata.get('stats', {})
+        self.build_date = metadata.get("build_date")
+        self.build_version = metadata.get("build_version")
+        self.src = metadata.get("src", {})
+        self.stats = metadata.get("stats", {})
 
         if self.build_date and isinstance(self.build_date, str):
-            self.build_date = dtparse(metadata['build_date']).astimezone()
+            self.build_date = dtparse(metadata["build_date"]).astimezone()
 
     def to_dict(self):
         return {
-            'biothing_type': self.biothing_type,
-            'build_date': self.build_date.isoformat()
-            if isinstance(self.build_date, datetime)
-            else self.build_date,
-            'build_version': self.build_version,
-            'src': self.src,
-            'stats': self.stats
+            "biothing_type": self.biothing_type,
+            "build_date": self.build_date.isoformat() if isinstance(self.build_date, datetime) else self.build_date,
+            "build_version": self.build_version,
+            "src": self.src,
+            "stats": self.stats,
         }
 
     def __add__(self, other):
-
         # combine biothing_type field
-        biothing_type = self.biothing_type,
+        biothing_type = self.biothing_type
         if other.biothing_type != self.biothing_type:
-            biothing_type = '__multiple__'
+            biothing_type = "__multiple__"
 
         # take the latest build_date
         # TODO if one of them is None
         build_date = self.build_date
-        if other.build_date > self.build_date:
+        if other.build_date and (not build_date or other.build_date > build_date):
+            # set to other.build_data if it's newer or current build_date is None
             build_date = other.build_date
 
         # combine build_version field
         build_version = self.build_version
         if other.build_version != build_version:
-            build_version = '__multiple__'
+            build_version = "__multiple__"
 
         # combine source field
         src = dict(self.src)
@@ -459,13 +541,15 @@ class BiothingHubMeta(BiothingMetaProp):
         stats = dict(self.stats)
         for key, value in other.stats.items():
             if key in stats:
-                stats[key] += value
+                if isinstance(stats[key], (int, float)) and isinstance(value, (int, float)):
+                    stats[key] += value
             else:  # new key
                 stats[key] = value
 
         return BiothingHubMeta(
             biothing_type=biothing_type,
-            build_date=build_date.isoformat(),
+            build_date=build_date.isoformat() if isinstance(build_date, datetime) else build_date,
             build_version=build_version,
             src=src,
-            stats=stats)
+            stats=stats,
+        )

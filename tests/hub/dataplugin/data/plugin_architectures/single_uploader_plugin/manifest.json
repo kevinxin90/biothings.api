@@ -1,0 +1,12 @@
+{
+    "version": "1.0",
+    "dumper": {
+        "data_url": [],
+        "uncompress": false,
+        "release": "version:get_release"
+    },
+    "uploader": {
+        "parser": "data_parser:size_loader",
+        "on_duplicates": "error"
+    }
+}

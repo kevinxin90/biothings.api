@@ -1,28 +1,28 @@
-""" 
-    Biothings Web Applications -
-    
-    define the routes and handlers a supported web framework would consume
-    basing on a config file, typically named `config.py`, enhanced by
-    :py:mod:`biothings.web.settings.configs`. 
-    
-    The currently supported web frameworks are
-    `Tornado <https://www.tornadoweb.org/en/stable/index.html>`_,
-    `Flask <https://flask.palletsprojects.com/en/2.0.x/>`_, and
-    `FastAPI <https://fastapi.tiangolo.com/>`_.
+"""
+Biothings Web Applications -
 
-    The :py:mod:`biothings.web.launcher` can start the compatible HTTP servers
-    basing on their interface. And the web applications delegate routes defined
-    in the config file to handlers typically in :py:mod:`biothings.web.handlers`. 
+define the routes and handlers a supported web framework would consume
+basing on a config file, typically named `config.py`, enhanced by
+:py:mod:`biothings.web.settings.configs`.
 
-    +----------------+------------+--------------------------------+
-    | Web Framework  | Interface  | Handlers                       |
-    +================+============+================================+
-    | Tornado        | Tornado    | biothings.web.handlers.*       |
-    +----------------+------------+--------------------------------+
-    | Flask          | WSGI       | biothings.web.handlers._flask  |
-    +----------------+------------+--------------------------------+
-    | FastAPI        | ASGI       | biothings.web.handlers._fastapi|
-    +----------------+------------+--------------------------------+
+The currently supported web frameworks are
+`Tornado <https://www.tornadoweb.org/en/stable/index.html>`_,
+`Flask <https://flask.palletsprojects.com/en/2.0.x/>`_, and
+`FastAPI <https://fastapi.tiangolo.com/>`_.
+
+The :py:mod:`biothings.web.launcher` can start the compatible HTTP servers
+basing on their interface. And the web applications delegate routes defined
+in the config file to handlers typically in :py:mod:`biothings.web.handlers`.
+
++----------------+------------+--------------------------------+
+| Web Framework  | Interface  | Handlers                       |
++================+============+================================+
+| Tornado        | Tornado    | biothings.web.handlers.*       |
++----------------+------------+--------------------------------+
+| Flask          | WSGI       | biothings.web.handlers._flask  |
++----------------+------------+--------------------------------+
+| FastAPI        | ASGI       | biothings.web.handlers._fastapi|
++----------------+------------+--------------------------------+
 
 """
 
@@ -36,12 +36,14 @@ import tornado.httpserver
 import tornado.ioloop
 import tornado.log
 import tornado.web
+
 from biothings.web.handlers import BaseAPIHandler, BaseQueryHandler
-from biothings.web.settings import configs
 from biothings.web.services.namespace import BiothingsNamespace
+from biothings.web.settings import configs
 
 try:
-    from raven.contrib.tornado import AsyncSentryClient
+    import sentry_sdk
+    from sentry_sdk.integrations.tornado import TornadoIntegration
 except ImportError:
     __SENTRY_INSTALLED__ = False
 else:
@@ -57,8 +59,8 @@ def load_class(kls):
         return locate(kls)
     raise ValueError()
 
-class TornadoBiothingsAPI(tornado.web.Application):
 
+class TornadoBiothingsAPI(tornado.web.Application):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.biothings = SimpleNamespace()
@@ -70,38 +72,47 @@ class TornadoBiothingsAPI(tornado.web.Application):
         method below can define a tornado application to start a web server.
         """
         settings = {
-            'biothings': biothings.config,
-            'autoreload': False,
-            'debug': False,
+            "biothings": biothings.config,
+            "autoreload": False,
+            "debug": False,
         }
         settings.update(override or {})
         supported_keywords = (
-            'default_handler_class', 'default_handler_args', 'template_path',
-            'log_function', 'compress_response', 'cookie_secret',
-            'login_url', 'static_path', 'static_url_prefix')
+            "default_handler_class",
+            "default_handler_args",
+            "template_path",
+            "log_function",
+            "compress_response",
+            "cookie_secret",
+            "login_url",
+            "static_path",
+            "static_url_prefix",
+        )
 
         for setting in supported_keywords:
             if hasattr(biothings.config, setting.upper()):
                 if setting in settings:
-                    logging.warning(
-                        "Override config setting %s to %s.",
-                        setting, settings[setting])
+                    logging.warning("Override config setting %s to %s.", setting, settings[setting])
                     continue
                 settings[setting] = getattr(biothings.config, setting.upper())
 
         if __SENTRY_INSTALLED__ and biothings.config.SENTRY_CLIENT_KEY:
-            # Setup error monitoring with Sentry. More on:
-            # https://docs.sentry.io/clients/python/integrations/#tornado
-            settings['sentry_client'] = AsyncSentryClient(biothings.config.SENTRY_CLIENT_KEY)
+            sentry_sdk.init(
+                dsn=biothings.config.SENTRY_CLIENT_KEY,
+                # adjust this value to allow sentry to trace transactions:
+                #   https://docs.sentry.io/platforms/python/guides/starlette/configuration/options/#traces-sample-rate
+                traces_sample_rate=0.2,
+                integrations=[TornadoIntegration()],
+            )
 
         return settings
 
     @staticmethod
     def _get_handlers(biothings, addons=None):
-        '''
+        """
         Generates the tornado.web.Application `(regex, handler_class, options) tuples
         <http://www.tornadoweb.org/en/stable/web.html#application-configuration>`_.
-        '''
+        """
         handlers = {}
         addons = addons or []
         for rule in biothings.config.APP_LIST + addons:
@@ -110,31 +121,32 @@ class TornadoBiothingsAPI(tornado.web.Application):
             setting = rule[2] if len(rule) == 3 else {}
             assert handler, rule[1]
 
-            if '{typ}' in pattern or '{tps}' in pattern:
+            if "{typ}" in pattern or "{tps}" in pattern:
                 if not issubclass(handler, BaseQueryHandler):
                     raise TypeError("Not a biothing_type-aware handler.")
-                if '{tps}' in pattern and len(biothings.metadata.types) <= 1:
+                if "{tps}" in pattern and len(biothings.metadata.types) <= 1:
                     continue  # '{tps}' routes only valid for multi-type apps
                 for biothing_type in biothings.metadata.types:
                     _pattern = pattern.format(
                         pre=biothings.config.APP_PREFIX,
                         ver=biothings.config.APP_VERSION,
-                        typ=biothing_type, tps=biothing_type
-                    ).replace('//', '/')
+                        typ=biothing_type,
+                        tps=biothing_type,
+                    ).replace("//", "/")
                     _setting = dict(setting)
-                    _setting['biothing_type'] = biothing_type
+                    _setting["biothing_type"] = biothing_type
                     handlers[_pattern] = (_pattern, handler, _setting)
-            elif '{pre}' in pattern or '{ver}' in pattern:
-                pattern = pattern.format(
-                    pre=biothings.config.APP_PREFIX,
-                    ver=biothings.config.APP_VERSION).replace('//', '/')
-                if '()' not in pattern:
+            elif "{pre}" in pattern or "{ver}" in pattern:
+                pattern = pattern.format(pre=biothings.config.APP_PREFIX, ver=biothings.config.APP_VERSION).replace(
+                    "//", "/"
+                )
+                if "()" not in pattern:
                     handlers[pattern] = (pattern, handler, setting)
             else:  # no pattern translation
                 handlers[pattern] = (pattern, handler, setting)
 
         handlers = list(handlers.values())
-        logger.info('API Handlers:\n%s', pformat(handlers, width=200))
+        logger.info("API Handlers:\n%s", pformat(handlers, width=200))
         return handlers
 
     @classmethod
@@ -154,22 +166,24 @@ class TornadoBiothingsAPI(tornado.web.Application):
             return app
         if isinstance(config, configs.ConfigPackage):
             biothings = BiothingsNamespace(config.root)
-            _handlers = [(f'/{c.APP_PREFIX}/.*', cls.get_app(c, settings)) for c in config.modules]
+            _handlers = [(f"/{c.APP_PREFIX}/.*", cls.get_app(c, settings)) for c in config.modules]
             _settings = BiothingsAPI._get_settings(biothings, settings)
             app = cls(_handlers + handlers or [], **_settings)
             app.biothings = biothings
-            app._populate_optionsets(config, handlers or [])
-            app._populate_handlers(handlers or [])
+            # app._populate_optionsets(config, handlers or [])
+            # app._populate_handlers(handlers or [])
+            app._populate_optionsets(config, _handlers + handlers or [])
+            app._populate_handlers(_handlers + handlers or [])
             return app
-        raise TypeError()
+        raise TypeError("Invalid config type. Must be a ConfigModule or ConfigPackage.")
 
     def _populate_optionsets(self, config, handlers):
         for handler in handlers:
             handler = handler[1]  # handler[0] is a matching pattern
-            if issubclass(handler, BaseAPIHandler) and handler.name:
+            if inspect.isclass(handler) and issubclass(handler, BaseAPIHandler) and handler.name:
                 handler_name = handler.name
                 handler_options = handler.kwargs
-                setting_attr = '_'.join((handler_name, 'kwargs')).upper()
+                setting_attr = "_".join((handler_name, "kwargs")).upper()
                 setting_options = getattr(config, setting_attr, {})
                 self.biothings.optionsets.add(handler_name, setting_options)
                 self.biothings.optionsets.add(handler_name, handler_options)
@@ -186,33 +200,35 @@ try:
         @classmethod
         def get_app(cls, config):
             app = cls(__name__)
-            app.config['JSON_SORT_KEYS'] = False
+            app.config["JSON_SORT_KEYS"] = False
             app.url_map.strict_slashes = False
             app.biothings = BiothingsNamespace(config)
             from biothings.web.handlers._flask import routes
+
             for route in routes:
-                setting_attr = '_'.join((route.name, 'kwargs')).upper()
+                setting_attr = "_".join((route.name, "kwargs")).upper()
                 setting_options = getattr(config, setting_attr, {})
                 app.biothings.optionsets.add(route.name, setting_options)
                 if isinstance(route.pattern, str):
                     route.pattern = [route.pattern]
                 for pattern in route.pattern:
-                    if '{typ}' in pattern:
+                    if "{typ}" in pattern:
                         assert len(app.biothings.metadata.types) == 1, (
-                            "Currently Biothings API on Flask only "
-                            "supports single biothings_type configuration."
+                            "Currently Biothings API on Flask only " "supports single biothings_type configuration."
                         )
-                    pattern = pattern.replace('{typ}', app.biothings.metadata.types[0])
-                    pattern = pattern.replace('{ver}', app.biothings.config.APP_VERSION)
+                    pattern = pattern.replace("{typ}", app.biothings.metadata.types[0])
+                    pattern = pattern.replace("{ver}", app.biothings.config.APP_VERSION)
                     app.add_url_rule(pattern, route.name, route, methods=route.methods)
                     app.biothings.handlers[pattern] = route
             return app
 
-except Exception as exc:
-    class FlaskBiothingsAPI():
+except Exception as exc:  # noqa F841
+
+    class FlaskBiothingsAPI:
         @classmethod
         def get_app(cls, config):
             raise exc
+
 
 try:
     from fastapi import FastAPI
@@ -240,10 +256,12 @@ try:
     #             app.get(*route.args, **route.kwargs)(route)
     #         return app
 
-except Exception as exc:
-    class FastAPIBiothingsAPI():
+except Exception as exc:  # noqa F841
+
+    class FastAPIBiothingsAPI:
         @classmethod
         def get_app(cls, config):
             raise exc
+
 
 BiothingsAPI = TornadoBiothingsAPI  # default

@@ -6,26 +6,47 @@ from collections import UserDict
 from copy import deepcopy
 from datetime import datetime
 from functools import partial
-from typing import NamedTuple, Optional
+from pathlib import Path
+from typing import NamedTuple, Optional, Union
 
 import elasticsearch
+from elasticsearch import AsyncElasticsearch
+
+
+from biothings import config as btconfig
 from biothings.hub import INDEXER_CATEGORY, INDEXMANAGER_CATEGORY
 from biothings.hub.databuild.backend import merge_src_build_metadata
-from biothings.utils.common import (get_class_from_classpath,
-                                    get_random_string, iter_n, traverse)
+from biothings.utils.common import (
+    first_exception,
+    get_class_from_classpath,
+    get_random_string,
+    iter_n,
+    merge,
+    traverse,
+)
+from biothings.hub.manager import BaseManager
 from biothings.utils.es import ESIndexer
 from biothings.utils.hub_db import get_src_build
 from biothings.utils.loggers import get_logger
-from biothings.utils.manager import BaseManager
-from biothings.utils.mongo import id_feeder
-from elasticsearch import AsyncElasticsearch
-from pymongo.mongo_client import MongoClient
+from biothings.utils.mongo import DatabaseClient, cached_client, id_feeder, kwargs_cache_key
+from biothings.utils.manager import JobManager
 
-from .indexer_payload import *
-from .indexer_registrar import *
-from .indexer_cleanup import Cleaner
-from .indexer_schedule import Schedule
-from .indexer_task import dispatch
+
+from biothings.hub.dataindex.exists_alias import (
+    DEFAULT_MIN_SUBFIELDS,
+    derive_exists_field_aliases,
+    store_exists_field_aliases,
+)
+from biothings.hub.dataindex.indexer_cleanup import Cleaner
+from biothings.hub.dataindex.indexer_payload import (
+    DEFAULT_INDEX_MAPPINGS,
+    DEFAULT_INDEX_SETTINGS,
+    IndexMappings,
+    IndexSettings,
+)
+from biothings.hub.dataindex.indexer_registrar import IndexJobStateRegistrar, MainIndexJSR, PostIndexJSR, PreIndexJSR
+from biothings.hub.dataindex.indexer_schedule import Schedule, SchedulerMismatchError
+from biothings.hub.dataindex.indexer_task import dispatch
 
 # Summary
 # -------
@@ -42,11 +63,18 @@ from .indexer_task import dispatch
 # Multi-layer logging
 
 
-class IndexerException(Exception):
-    ...
+class IndexerException(Exception): ...
 
-class ProcessInfo():
 
+INDEX_MODES = {
+    "index": "Create a new index and fail if it already exists.",
+    "resume": "Use an existing index and add missing documents.",
+    "purge": "Delete an existing index before creating it.",
+    "merge": "Merge source documents into an existing index.",
+}
+
+
+class ProcessInfo:
     def __init__(self, indexer, concurrency):
         self.indexer = indexer
         self.concurrency = concurrency
@@ -54,14 +82,15 @@ class ProcessInfo():
     def get_predicates(self):
         def limit_indexer_concurrency(job_manager):
             def by_indexer_environment(job):
-                return all((
-                    job["category"] == INDEXER_CATEGORY,
-                    job["source"] == self.indexer.env_name
-                ))
-            return len(list(filter(
-                by_indexer_environment,
-                job_manager.jobs.values()
-            ))) < self.concurrency
+                return all(
+                    (
+                        job["category"] == INDEXER_CATEGORY,
+                        job["source"] == self.indexer.env_name,
+                    )
+                )
+
+            return len(list(filter(by_indexer_environment, job_manager.jobs.values()))) < self.concurrency
+
         return [limit_indexer_concurrency]
 
     def get_pinfo(self, step="", description=""):
@@ -74,17 +103,19 @@ class ProcessInfo():
             "category": INDEXER_CATEGORY,
             "source": self.indexer.env_name,
             "description": description,
-            "step": step
+            "step": step,
         }
         return pinfo
+
 
 class _BuildBackend(NamedTuple):  # mongo
     args: dict = {}
     dbs: Optional[str] = None
     col: Optional[str] = None
 
+
 class _BuildDoc(UserDict):
-    """ Represent A Build Under "src_build" Collection.
+    """Represent A Build Under "src_build" Collection.
 
     Example:
     {
@@ -114,6 +145,7 @@ class _BuildDoc(UserDict):
         ...
     }
     """
+
     @property
     def build_name(self):
         return self.get("_id")
@@ -131,9 +163,7 @@ class _BuildDoc(UserDict):
         settings["number_of_shards"] = self.build_config.get("num_shards", 1)
         settings["number_of_replicas"] = self.build_config.get("num_replicas", 0)
         # this feature may be removed at any time
-        settings.update(
-            self.build_config.get("extra_index_settings", {})
-        )
+        settings.update(self.build_config.get("extra_index_settings", {}))
 
     def parse_backend(self):
         # Support Sebastian's hub style backend URI
@@ -143,8 +173,6 @@ class _BuildDoc(UserDict):
 
         # Case 1:
         # As a dummy indexer
-        # Used in validate_mapping, ...
-
         if backend is None:
             return _BuildBackend()
 
@@ -158,10 +186,10 @@ class _BuildDoc(UserDict):
             db = backend.mongo.get_target_db()
             if backend_url in db.list_collection_names():
                 return _BuildBackend(
-                    dict(zip(
-                        ("host", "port"),
-                        db.client.address
-                    )), db.name, backend_url)
+                    dict(zip(("host", "port"), db.client.address)),
+                    db.name,
+                    backend_url,
+                )
 
         # Case 3:
         # For single source build_config(s)
@@ -177,16 +205,16 @@ class _BuildDoc(UserDict):
 
             if backend_url[1] in db.list_collection_names():
                 return _BuildBackend(
-                    dict(zip(
-                        ("host", "port"),
-                        db.client.address
-                    )), db.name, backend_url[1])
+                    dict(zip(("host", "port"), db.client.address)),
+                    db.name,
+                    backend_url[1],
+                )
 
         raise ValueError(backend, backend_url)
 
     def extract_coldbuild(self):
         cold_target = self.build_config["cold_collection"]
-        cold_build_doc = get_src_build().find_one({'_id': cold_target})
+        cold_build_doc = get_src_build().find_one({"_id": cold_target})
         cold_build_doc = _BuildDoc(cold_build_doc)
 
         cold_build_doc["_id"] = self.build_name  # *
@@ -198,11 +226,9 @@ class _BuildDoc(UserDict):
         # Indices & snapshots are only registered there.
 
         if self.build_config.get("num_shards"):
-            cold_build_doc.build_config["num_shards"] = \
-                self.build_config["num_shards"]
+            cold_build_doc.build_config["num_shards"] = self.build_config["num_shards"]
         if self.build_config.get("num_replicas"):
-            cold_build_doc.build_config["num_replicas"] =  \
-                self.build_config["num_replicas"]
+            cold_build_doc.build_config["num_replicas"] = self.build_config["num_replicas"]
         return cold_build_doc
 
 
@@ -226,7 +252,8 @@ class Step(abc.ABC):
             get_src_build(),
             indexer.build_name,
             indexer.es_index_name,
-            logfile=indexer.logfile)
+            logfile=indexer.logfile,
+        )
 
     @classmethod
     def __init_subclass__(cls):
@@ -236,53 +263,50 @@ class Step(abc.ABC):
     def dispatch(cls, name):
         return cls.catelog[name]
 
-    @asyncio.coroutine
-    def execute(self, *args, **kwargs):
+    async def execute(self, *args, **kwargs):
         coro = getattr(self.indexer, self.method)
         coro = coro(*args, **kwargs)
-        return (yield from coro)
+        return await coro
 
     def __str__(self):
-        return (
-            f"<Step"
-            f" name='{self.name}'"
-            f" indexer={self.indexer}"
-            f">"
-        )
+        return f"<Step name='{self.name}' indexer={self.indexer}>"
+
 
 class PreIndexStep(Step):
     name = "pre"
     state = PreIndexJSR
     method = "pre_index"
 
+
 class MainIndexStep(Step):
     name = "index"
     state = MainIndexJSR
     method = "do_index"
+
 
 class PostIndexStep(Step):
     name = "post"
     state = PostIndexJSR
     method = "post_index"
 
-class _IndexerResult(UserDict):
 
+class _IndexerResult(UserDict):
     def __str__(self):
         return f"{type(self).__name__}({str(self.data)})"
 
-class IndexerCumulativeResult(_IndexerResult):
-    ...
 
-class IndexerStepResult(_IndexerResult):
-    ...
+class IndexerCumulativeResult(_IndexerResult): ...
 
-class Indexer():
+
+class IndexerStepResult(_IndexerResult): ...
+
+
+class Indexer:
     """
     MongoDB -> Elasticsearch Indexer.
     """
 
-    def __init__(self, build_doc, indexer_env, index_name):
-
+    def __init__(self, build_doc: dict, indexer_env: dict, index_name: str):
         # build_doc primarily describes the source.
         # indexer_env primarily describes the destination.
 
@@ -314,25 +338,32 @@ class Indexer():
         self.conf_name = _build_doc.build_config.get("name")
         self.build_name = _build_doc.build_name
 
-        self.logger, self.logfile = get_logger('index_%s' % self.es_index_name)
+        # Enable with True; an integer sets the minimum subfield count. Zero disables the scan.
+        self.exists_alias_scan = _build_doc.build_config.get("exists_field_alias_scan", False)
+
+        self.setup_log()
         self.pinfo = ProcessInfo(self, indexer_env.get("concurrency", 10))
+
+    def setup_log(self):
+        log_folder = (
+            os.path.join(btconfig.LOG_FOLDER, "build", self.build_name or "", "index") if btconfig.LOG_FOLDER else None
+        )
+        log_name = f"index_{self.es_index_name}"
+        self.logger, self.logfile = get_logger(log_name, log_folder=log_folder, force=True)
 
     def __str__(self):
         showx = self.mongo_collection_name != self.es_index_name
         lines = [
             f"<{type(self).__name__}",
             f" source='{self.mongo_collection_name}'" if showx else "",
-            f" dest='{self.es_index_name}'"
-            f">"
+            f" dest='{self.es_index_name}'>",
         ]
         return "".join(lines)
 
     # --------------
     #  Entry Point
     # --------------
-
-    @asyncio.coroutine
-    def index(self, job_manager, **kwargs):
+    async def index(self, job_manager, **kwargs):
         """
         Build an Elasticsearch index (self.es_index_name)
         with data from MongoDB collection (self.mongo_collection_name).
@@ -347,8 +378,10 @@ class Indexer():
         """
 
         steps = kwargs.pop("steps", ("pre", "index", "post"))
+        defer_index_registration = kwargs.pop("_defer_index_registration", False)
         batch_size = kwargs.setdefault("batch_size", 10000)
-        mode = kwargs.setdefault("mode", "index")
+        # mode = kwargs.setdefault("mode", "index")
+        kwargs.setdefault("mode", "index")
         ids = kwargs.setdefault("ids", None)
 
         assert job_manager
@@ -363,13 +396,20 @@ class Indexer():
         # can be sent to elasticsearch within one request, making it
         # inefficient, amplifying the scheduling overhead.
 
+        ordered_steps = tuple(Step.order(steps))
+        defer_index_registration = defer_index_registration or ("index" in ordered_steps and "post" in ordered_steps)
+
         x = IndexerCumulativeResult()
-        for step in Step.order(steps):
-            step = Step.dispatch(step)(self)
+        for step_name in ordered_steps:
+            step = Step.dispatch(step_name)(self)
             self.logger.info(step)
-            step.state.started()
+            state_context = {}
+            mode = kwargs.get("mode")
+            if step.name == "pre" and mode and mode != "index":
+                state_context["mode"] = mode
+            step.state.started(**state_context)
             try:
-                dx = yield from step.execute(job_manager, **kwargs)
+                dx = await step.execute(job_manager, **kwargs)
                 dx = IndexerStepResult(dx)
             except Exception as exc:
                 _exc = str(exc)[:500]
@@ -380,153 +420,175 @@ class Indexer():
                 merge(x.data, dx.data)
                 self.logger.info(dx)
                 self.logger.info(x)
-                step.state.succeed(x.data)
+                if step.name == "index" and defer_index_registration:
+                    step.state.succeed_without_registration()
+                else:
+                    step.state.succeed(x.data)
 
         return x
 
     # ---------
     #   Steps
     # ---------
-
-    @asyncio.coroutine
-    def pre_index(self, *args, mode, **kwargs):
-
+    async def pre_index(self, *args, mode, **kwargs):
         client = AsyncElasticsearch(**self.es_client_args)
         try:
             if mode in ("index", None):
-
                 # index MUST NOT exist
                 # ----------------------
-
-                if (yield from client.indices.exists(self.es_index_name)):
-                    msg = ("Index '%s' already exists, (use mode='purge' to "
-                           "auto-delete it or mode='resume' to add more documents)")
+                if await client.indices.exists(index=self.es_index_name):
+                    msg = (
+                        "Index '%s' already exists, (use mode='purge' to "
+                        "auto-delete it or mode='resume' to add more documents)"
+                    )
                     raise IndexerException(msg % self.es_index_name)
 
             elif mode in ("resume", "merge"):
-
                 # index MUST exist
                 # ------------------
 
-                if not (yield from client.indices.exists(self.es_index_name)):
+                if not (await client.indices.exists(index=self.es_index_name)):
                     raise IndexerException("'%s' does not exist." % self.es_index_name)
                 self.logger.info(("Exists", self.es_index_name))
                 return  # skip index creation
 
             elif mode == "purge":
-
                 # index MAY exist
                 # -----------------
 
-                response = yield from client.indices.delete(self.es_index_name, ignore_unavailable=True)
+                response = await client.indices.delete(index=self.es_index_name, ignore_unavailable=True)
                 self.logger.info(("Deleted", self.es_index_name, response))
 
             else:
                 raise ValueError("Invalid mode: %s" % mode)
 
-            response = yield from client.indices.create(self.es_index_name, body={
-                "settings": (yield from self.es_index_settings.finalize(client)),
-                "mappings": (yield from self.es_index_mappings.finalize(client))
-            })
+            response = await client.indices.create(
+                index=self.es_index_name,
+                body={
+                    "settings": (await self.es_index_settings.finalize(client)),
+                    "mappings": (await self.es_index_mappings.finalize(client)),
+                },
+            )
             self.logger.info(("Created", self.es_index_name, response))
             return {
-                '__REPLACE__': True,
-                'host': self.es_client_args.get('hosts'),  # for frontend display
-                'environment': self.env_name,  # used in snapshot module.
+                "__REPLACE__": True,
+                "host": self.es_client_args.get("hosts"),  # for frontend display
+                "environment": self.env_name,  # used in snapshot module.
             }
 
         finally:
-            yield from client.close()
+            await client.close()
 
-    @asyncio.coroutine
-    def do_index(self, job_manager, batch_size, ids, mode, **kwargs):
-
-        client = MongoClient(**self.mongo_client_args)
+    async def do_index(self, job_manager, batch_size, ids, mode, **kwargs):
+        # DatabaseClient holds a connection pool and is meant to be created once and
+        # shared, not per call - do_index() runs once per indexing job, but a hub can run
+        # many index jobs over its lifetime, so an uncached client here still leaks one
+        # connection pool per job into the long-lived hub process.
+        key = kwargs_cache_key("indexer_mongo_client", self.mongo_client_args)
+        client = cached_client(key, lambda: DatabaseClient(**self.mongo_client_args))
         database = client[self.mongo_database_name]
         collection = database[self.mongo_collection_name]
 
         if ids:
             self.logger.info(
-                (
-                    "Indexing from '%s' with specific list of _ids, "
-                    "create indexer job with batch_size=%d."
-                ),
-                self.mongo_collection_name, batch_size
+                ("Indexing from '%s' with specific list of _ids, " "create indexer job with batch_size=%d."),
+                self.mongo_collection_name,
+                batch_size,
             )
             # use user provided ids in batch
             id_provider = iter_n(ids, batch_size)
         else:
             self.logger.info(
-                (
-                    "Fetch _ids from '%s', and create "
-                    "indexer job with batch_size=%d."
-                ),
-                self.mongo_collection_name, batch_size
+                ("Fetch _ids from '%s', and create " "indexer job with batch_size=%d."),
+                self.mongo_collection_name,
+                batch_size,
             )
             # use ids from the target mongodb collection in batch
             id_provider = id_feeder(collection, batch_size, logger=self.logger)
 
-        jobs = []  # asyncio.Future(s)
-        error = None  # the first Exception
-
         total = len(ids) if ids else collection.count()
         schedule = Schedule(total, batch_size)
 
-        def batch_finished(future):
-            nonlocal error
+        async def batch_finished(job):
             try:
-                schedule.finished += future.result()
+                count = await job
             except Exception as exc:
-                self.logger.warning(exc)
-                error = exc
+                self.logger.error(exc)
+                raise
+            # resolve the await into a local first: "schedule.finished += await job"
+            # would read schedule.finished before suspending, so concurrent
+            # batch_finished tasks would clobber each other's increments
+            schedule.finished += count
 
-        for batch_num, ids in zip(schedule, id_provider):
-            yield from asyncio.sleep(0.0)
+        try:
+            # when one batch fails, and job scheduling has not completed,
+            # the TaskGroup stops scheduling and cancels all on-going jobs,
+            # to fail quickly.
+            async with asyncio.TaskGroup() as tg:
+                for batch_num, ids in zip(schedule, id_provider):
+                    await asyncio.sleep(0.0)
+                    self.logger.info(schedule)
 
-            # when one batch failed, and job scheduling has not completed,
-            # stop scheduling and cancel all on-going jobs, to fail quickly.
+                    pinfo = self.pinfo.get_pinfo(schedule.suffix(self.mongo_collection_name))
 
-            if error:
-                for job in jobs:
-                    if not job.done():
-                        job.cancel()
-                raise error
-
-            self.logger.info(schedule)
-
-            pinfo = self.pinfo.get_pinfo(
-                schedule.suffix(self.mongo_collection_name))
-
-            job = yield from job_manager.defer_to_process(
-                pinfo, dispatch,
-                self.mongo_client_args,
-                self.mongo_database_name,
-                self.mongo_collection_name,
-                self.es_client_args,
-                self.es_blkidx_args,
-                self.es_index_name,
-                ids, mode, batch_num
-            )
-            job.add_done_callback(batch_finished)
-            jobs.append(job)
+                    job = await job_manager.defer_to_process(
+                        pinfo,
+                        dispatch,
+                        self.mongo_client_args,
+                        self.mongo_database_name,
+                        self.mongo_collection_name,
+                        self.es_client_args,
+                        self.es_blkidx_args,
+                        self.es_index_name,
+                        ids,
+                        mode,
+                        batch_num,
+                    )
+                    tg.create_task(batch_finished(job))
+        except* Exception as eg:
+            raise first_exception(eg) from eg
 
         self.logger.info(schedule)
-        yield from asyncio.gather(*jobs)
 
-        schedule.completed()
+        try:
+            schedule.completed()
+        except SchedulerMismatchError as schedule_error:
+            scheduler_error_message = (
+                f"mongo client configuration: {self.mongo_client_args} | "
+                f"mongo database: {self.mongo_database_name} | "
+                f"mongo collection: {self.mongo_collection_name} "
+            )
+            self.logger.error(scheduler_error_message)
+            raise schedule_error
+
         self.logger.notify(schedule)
-        return {
-            "count": total,
-            "created_at": datetime.now().astimezone()
-        }
+        return {"count": total, "created_at": datetime.now().astimezone()}
 
-    @asyncio.coroutine
-    def post_index(self, *args, **kwargs):
-        ...
+    async def post_index(self, *_args, **_kwargs):
+        """Derive and store exists aliases when enabled in the build config."""
+        if not self.exists_alias_scan:
+            return {}
+
+        scan = self.exists_alias_scan
+        min_subfields = scan if isinstance(scan, int) and not isinstance(scan, bool) else DEFAULT_MIN_SUBFIELDS
+        client = AsyncElasticsearch(**self.es_client_args)
+        try:
+            aliases = await derive_exists_field_aliases(
+                client, self.es_index_name, min_subfields=min_subfields, logger=self.logger
+            )
+            await store_exists_field_aliases(client, self.es_index_name, aliases, logger=self.logger)
+        except Exception as exc:
+            # Alias scan failures should not fail the build.
+            self.logger.exception("Could not derive _exists_ aliases: %s", exc)
+            return {}
+        finally:
+            await client.close()
+
+        return {"exists_field_aliases": aliases}
 
 
-class ColdHotIndexer():
-    """ MongoDB to Elasticsearch 2-pass Indexer.
+class ColdHotIndexer:
+    """MongoDB to Elasticsearch 2-pass Indexer.
     (
         1st pass: <MongoDB Cold Collection>, # static data
         2nd pass: <MongoDB Hot Collection> # changing data
@@ -547,37 +609,52 @@ class ColdHotIndexer():
         self.hot = self.INDEXER(hot_build_doc, indexer_env, index_name)
         self.cold = self.INDEXER(cold_build_doc, indexer_env, self.hot.es_index_name)
 
-    @asyncio.coroutine
-    def index(self,
-              job_manager,
-              batch_size=10000,
-              steps=("pre", "index", "post"),
-              ids=None, mode=None,
-              **kwargs):
-
+    async def index(
+        self,
+        job_manager,
+        batch_size=10000,
+        steps=("pre", "index", "post"),
+        ids=None,
+        mode=None,
+        **kwargs,
+    ):
         result = []
+        ordered_steps = tuple(Step.order(steps))
+        defer_index_registration = "index" in ordered_steps and "post" in ordered_steps
 
         cold_task = self.cold.index(
-            job_manager, steps=set(Step.order(steps)) & {"pre", "index"},
-            batch_size=batch_size, ids=ids, mode=mode)
-        result.append((yield from cold_task))
+            job_manager,
+            steps=set(ordered_steps) & {"pre", "index"},
+            _defer_index_registration=defer_index_registration,
+            batch_size=batch_size,
+            ids=ids,
+            mode=mode,
+        )
+        result.append((await cold_task))
 
         hot_task = self.hot.index(
-            job_manager, steps=set(Step.order(steps)) & {"index", "post"},
-            batch_size=batch_size, ids=ids, mode="merge")
-        result.append((yield from hot_task))
+            job_manager,
+            steps=set(ordered_steps) & {"index", "post"},
+            batch_size=batch_size,
+            ids=ids,
+            mode="merge",
+        )
+        result.append((await hot_task))
 
         return result
 
 
 class IndexManager(BaseManager):
-
     # An index config is considered a "source" for the manager
     # Each call returns a different instance from a factory call
 
     DEFAULT_INDEXER = Indexer
 
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        job_manager: JobManager,
+        poll_schedule=None,
+    ):
         """
         An example of config dict for this module.
         {
@@ -590,7 +667,7 @@ class IndexManager(BaseManager):
                     "host": "localhost:9200",
                     "indexer": {
                         "args": {
-                            "timeout": 300,
+                            "request_timeout": 300,
                             "retry_on_timeout": True,
                             "max_retries": 10,
                         },
@@ -610,11 +687,10 @@ class IndexManager(BaseManager):
             }
         }
         """
-        super().__init__(*args, **kwargs)
+        super().__init__(job_manager, poll_schedule)
         self._srcbuild = get_src_build()
         self._config = {}
-
-        self.logger, self.logfile = get_logger('indexmanager')
+        self.logger, self.logfile = get_logger("indexmanager")
 
     # Object Lifecycle Calls
     # --------------------------
@@ -634,9 +710,9 @@ class IndexManager(BaseManager):
         # During heavy indexing, the following settings
         # significantly increase the one-pass success rate.
         esargs = {
-            "timeout": 300,
+            "request_timeout": 300,
             "retry_on_timeout": True,
-            "max_retries": 10
+            "max_retries": 10,
         }
 
         # register each indexing environment
@@ -656,10 +732,7 @@ class IndexManager(BaseManager):
         def no_other_indexmanager_step_running(job_manager):
             """IndexManager deals with snapshot, publishing,
             none of them should run more than one at a time"""
-            return len([
-                j for j in job_manager.jobs.values()
-                if j["category"] == INDEXMANAGER_CATEGORY
-            ]) == 0
+            return len([j for j in job_manager.jobs.values() if j["category"] == INDEXMANAGER_CATEGORY]) == 0
 
         return [no_other_indexmanager_step_running]
 
@@ -672,7 +745,7 @@ class IndexManager(BaseManager):
             "category": INDEXMANAGER_CATEGORY,
             "source": "",
             "step": "",
-            "description": ""
+            "description": "",
         }
         preds = self.get_predicates()
         if preds:
@@ -683,7 +756,7 @@ class IndexManager(BaseManager):
     # --------------
 
     def _select_indexer(self, build_name=None):
-        """ Find the indexer class required to index build_name. """
+        """Find the indexer class required to index build_name."""
 
         rules = self._config.get("indexer_select")
         if not rules or not build_name:
@@ -695,7 +768,7 @@ class IndexManager(BaseManager):
 
         path = None
         doc = self._srcbuild.find_one({"_id": build_name})
-        for path_in_doc, _ in traverse(doc or dict(), True):
+        for path_in_doc, _ in traverse(doc or {}, True):
             if path_in_doc in rules:
                 if not path:
                     path = path_in_doc
@@ -715,26 +788,26 @@ class IndexManager(BaseManager):
         """
 
         indexer_env_ = dict(self[indexer_env])  # describes a destination
-        build_doc = self._srcbuild.find_one({'_id': build_name})  # describes a source
+        build_doc = self._srcbuild.find_one({"_id": build_name})  # describes a source
 
         if not build_doc:
             raise ValueError("Cannot find build %s." % build_name)
         if not build_doc.get("build_config"):
             raise ValueError("Cannot find build config for '%s'." % build_name)
 
-        idx = self._select_indexer(build_name)
-        idx = idx(build_doc, indexer_env_, index_name)
-        job = idx.index(self.job_manager, ids=ids, **kwargs)
-        job = asyncio.ensure_future(job)
-        job.add_done_callback(self.logger.debug)
-
+        indexer_class = self._select_indexer(build_name)
+        indexer_instance = indexer_class(build_doc, indexer_env_, index_name)
+        self.logger.info("Created indexer instance %s", indexer_instance)
+        job = self.job_manager.loop.create_task(indexer_instance.index(self.job_manager, ids=ids, **kwargs))
         return job
 
-    def update_metadata(self,
-                        indexer_env,
-                        index_name,
-                        build_name=None,
-                        _meta=None):
+    def update_metadata(
+        self,
+        indexer_env,
+        index_name,
+        build_name=None,
+        _meta=None,
+    ):
         """
         Update _meta field of the index mappings, basing on
             1. the _meta value provided, including {}.
@@ -747,13 +820,13 @@ class IndexManager(BaseManager):
             update_metadata("local", "mynews_201228_vsdevjd", _meta={"author":"b"})
             update_metadata("local", "mynews_201228_current", "mynews_201228_vsdevjd")
         """
+
         async def _update_meta(_meta):
             env = self.register[indexer_env]
             async with AsyncElasticsearch(**env["args"]) as client:
-
                 doc_type = None
-                if int((await client.info())['version']['number'].split('.')[0]) < 7:
-                    mappings = client.indices.get_mapping(index_name)
+                if int((await client.info())["version"]["number"].split(".")[0]) < 7:
+                    mappings = client.indices.get_mapping(index=index_name)
                     mappings = mappings[index_name]["mappings"]
                     doc_type = next(iter(mappings.keys()))
 
@@ -765,41 +838,122 @@ class IndexManager(BaseManager):
                 return await client.indices.put_mapping(
                     body=dict(_meta=_meta),
                     index=index_name,
-                    doc_type=doc_type
+                    doc_type=doc_type,
                 )
 
-        job = asyncio.ensure_future(_update_meta(_meta))
+        job = self.job_manager.loop.create_task(_update_meta(_meta))
+        # logging the result doubles as marking the exception retrieved
         job.add_done_callback(self.logger.debug)
         return job
 
     def index_info(self, remote=False):
-        """ Show index manager config with enhanced index information. """
+        """Show index manager config with enhanced index information."""
         # http://localhost:7080/index_manager
 
-        async def _enhance(conf):
+        def _with_supported_modes(conf):
             conf = copy.deepcopy(conf)
+            conf["index_modes"] = copy.deepcopy(INDEX_MODES)
+            return conf
+
+        async def _enhance(conf):
+            conf = _with_supported_modes(conf)
 
             for name, env in self.register.items():
                 async with AsyncElasticsearch(**env["args"]) as client:
                     try:
-                        indices = await client.indices.get("*")
+                        indices = await client.indices.get(index="*")
                     except elasticsearch.exceptions.ConnectionError:
                         ...  # keep the hard-coded place-holders info
                     else:  # replace the index key with remote info
-                        conf["env"][name]["index"] = [{
-                            "index": k, "aliases": list(v["aliases"].keys()),
-                        } for k, v in indices.items()]
+                        conf["env"][name]["index"] = [
+                            {
+                                "index": k,
+                                "aliases": list(v["aliases"].keys()),
+                                "doc_type": v["mappings"]["_meta"]["biothing_type"],
+                            }
+                            for k, v in indices.items()
+                            if "_meta" in v["mappings"] and "biothing_type" in v["mappings"]["_meta"]
+                        ]
             return conf
 
         if remote:
-            job = asyncio.ensure_future(_enhance(self._config))
+            job = self.job_manager.loop.create_task(_enhance(self._config))
+            # logging the result doubles as marking the exception retrieved
             job.add_done_callback(self.logger.debug)
             return job
 
-        return self._config
+        return _with_supported_modes(self._config)
+
+    def get_indexes_by_name(self, index_name=None, env_name=None, limit=10):
+        """Accept an index_name and return a list of indexes get from all elasticsearch environments
+        or from specific elasticsearch environment.
+
+        If index_name is blank, it will be return all indexes.
+        limit can be used to specify how many indexes should be return.
+
+        The list of indexes will be like this:
+        [
+            {
+                "index_name": "...",
+                "build_version": "...",
+                "count": 1000,
+                "creation_date": 1653468868933,
+                "environment": {
+                    "name": "env name",
+                    "host": "localhost:9200",
+                }
+            },
+        ]
+        """
+
+        if not index_name:
+            index_name = "*"
+        limit = int(limit)
+
+        async def fetch(index_name, env_name=None, limit=None):
+            indexes = []
+            for _env_name, env in self.register.items():
+                # If env_name is set, only fetch indexes for the specific es server
+                if env_name and env_name != _env_name:
+                    continue
+
+                async with AsyncElasticsearch(**env["args"]) as client:
+                    try:
+                        indices = await client.indices.get(index=index_name)
+                    except Exception:
+                        continue
+                    for index_name, index_data in indices.items():
+                        if "_meta" in index_data["mappings"] and "biothing_type" in index_data["mappings"]["_meta"]:
+                            mapping_meta = index_data["mappings"]["_meta"]
+                            stats = mapping_meta.get("stats", {})
+                            count = stats.get("total", stats.get("total_documents"))
+                            if count is not None:
+                                indexes.append(
+                                    {
+                                        "index_name": index_name,
+                                        "doc_type": mapping_meta["biothing_type"],
+                                        "build_version": mapping_meta["build_version"],
+                                        "count": count,
+                                        "creation_date": index_data["settings"]["index"]["creation_date"],
+                                        "environment": {
+                                            "name": _env_name,
+                                            "host": env["args"]["hosts"],
+                                        },
+                                    }
+                                )
+
+            indexes.sort(key=lambda index: index["creation_date"], reverse=True)
+
+            if limit:
+                indexes = indexes[:limit]
+            return indexes
+
+        job = self.job_manager.loop.create_task(fetch(index_name, env_name=env_name, limit=limit))
+        # logging the result doubles as marking the exception retrieved
+        job.add_done_callback(self.logger.debug)
+        return job
 
     def validate_mapping(self, mapping, env):
-
         indexer = self._select_indexer()  # default indexer
         indexer = indexer(dict(mapping=mapping), self[env], None)
 
@@ -807,25 +961,28 @@ class IndexManager(BaseManager):
         self.logger.debug(indexer.es_index_settings)
         self.logger.debug(indexer.es_index_mappings)
 
-        @asyncio.coroutine
-        def _validate_mapping():
+        async def _validate_mapping():
             client = AsyncElasticsearch(**indexer.es_client_args)
             index_name = ("hub_tmp_%s" % get_random_string()).lower()
             try:
-                return (yield from client.indices.create(index_name, body={
-                    "settings": (yield from indexer.es_index_settings.finalize(client)),
-                    "mappings": (yield from indexer.es_index_mappings.finalize(client))
-                }))
+                return await client.indices.create(
+                    index_name,
+                    body={
+                        "settings": (await indexer.es_index_settings.finalize(client)),
+                        "mappings": (await indexer.es_index_mappings.finalize(client)),
+                    },
+                )
             finally:
-                yield from client.indices.delete(index_name, ignore_unavailable=True)
-                yield from client.close()
+                await client.indices.delete(index_name, ignore_unavailable=True)
+                await client.close()
 
-        job = asyncio.ensure_future(_validate_mapping())
+        job = self.job_manager.loop.create_task(_validate_mapping())
+        # logging the result doubles as marking the exception retrieved
         job.add_done_callback(self.logger.info)
         return job
 
     def cleanup(self, env=None, keep=3, dryrun=True, **filters):
-        """ Delete old indices except for the most recent ones.
+        """Delete old indices except for the most recent ones.
 
         Examples:
             >>> index_cleanup()
@@ -841,17 +998,23 @@ class IndexManager(BaseManager):
         cleanups = cleaner.find(env, keep, **filters)
 
         if dryrun:
-            return '\n'.join((
-                "-" * 75, cleaner.plain_text(cleanups), "-" * 75,
-                "DRYRUN ONLY - APPLY THE ACTIONS WITH:",
-                "   > index_cleanup(..., dryrun=False)"
-            ))
+            return "\n".join(
+                (
+                    "-" * 75,
+                    cleaner.plain_text(cleanups),
+                    "-" * 75,
+                    "DRYRUN ONLY - APPLY THE ACTIONS WITH:",
+                    "   > index_cleanup(..., dryrun=False)",
+                )
+            )
 
-        job = asyncio.ensure_future(cleaner.clean(cleanups))
+        job = self.job_manager.loop.create_task(cleaner.clean(cleanups))
+        # logging the result doubles as marking the exception retrieved
         job.add_done_callback(self.logger.info)
         return job
 
-class DynamicIndexerFactory():
+
+class DynamicIndexerFactory:
     """
     In the context of autohub/standalone instances, create indexer
     with parameters taken from versions.json URL.
@@ -874,13 +1037,16 @@ class DynamicIndexerFactory():
                 # actual_url = url
             self.bynames[name] = {
                 "es_host": self.es_host,
-                "index": name + suffix
+                "index": name + suffix,
             }
 
     def create(self, name):
         conf = self.bynames[name]
-        pidxr = partial(ESIndexer, index=conf["index"],
-                        doc_type=None,
-                        es_host=conf["es_host"])
+        pidxr = partial(
+            ESIndexer,
+            index=conf["index"],
+            doc_type=None,
+            es_host=conf["es_host"],
+        )
         conf = {"es_host": conf["es_host"], "index": conf["index"]}
         return pidxr, conf

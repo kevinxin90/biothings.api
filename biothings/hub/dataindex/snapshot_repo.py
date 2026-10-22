@@ -1,9 +1,9 @@
-
 import elasticsearch
 
+from biothings.utils.exceptions import RepositoryVerificationFailed
 
-class Repository():
 
+class Repository:
     def __init__(self, client, repository):
         # Corresponds to HTTP operations on
         # /_snapshot/<repository>
@@ -13,17 +13,45 @@ class Repository():
 
     def exists(self):
         try:
-            self.client.snapshot.get_repository(self.name)
+            self.client.snapshot.get_repository(name=self.name)
         except elasticsearch.exceptions.NotFoundError:
             return False
         return True
 
     def create(self, **body):
         # https://www.elastic.co/guide/en/elasticsearch/plugins/current/repository-s3-client.html
-        return self.client.snapshot.create_repository(self.name, body=body)
+        return self.client.snapshot.create_repository(name=self.name, body=body)
 
     def delete(self):
-        self.client.snapshot.delete_repository(self.name)
+        self.client.snapshot.delete_repository(name=self.name)
+
+    def verify(self, config):
+        """A repository is consider properly setup and working, when:
+        - passes verification of ElasticSearch
+        - it's settings must match with the snapshot's config.
+        """
+
+        # Check if the repo pass ElasticSearch's verification
+        self.client.snapshot.verify_repository(name=self.name)
+
+        # Check if the repo's settings match with the snapshot's config
+        repo_settings = self.client.snapshot.get_repository(name=self.name)[self.name]
+        incorrect_data = {}
+
+        for field in ["type", "settings"]:
+            if config[field] != repo_settings[field]:
+                incorrect_data[field] = {"config": config[field], "repo": repo_settings[field]}
+
+        if incorrect_data:
+            raise RepositoryVerificationFailed(
+                {
+                    "error": "repository_verification_exception",
+                    "detail": {
+                        "message": "the repository's settings is not match with snapshot config.",
+                        "diff": incorrect_data,
+                    },
+                }
+            )
 
     def __str__(self):
         return (
@@ -33,14 +61,18 @@ class Repository():
             f">"
         )
 
+
 def test_01():
     from elasticsearch import Elasticsearch
+
     client = Elasticsearch()
     snapshot = Repository(client, "mynews")
     print(snapshot)
 
+
 def test_02():
     from elasticsearch import Elasticsearch
+
     client = Elasticsearch()
     snapshot = Repository(client, "______")
     print(snapshot)

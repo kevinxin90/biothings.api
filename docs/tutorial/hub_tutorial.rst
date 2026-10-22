@@ -12,6 +12,9 @@ containing all the data of interest, ready to be served as an API, using
 Biothings SDK Web component (covered in another tutorial).
 Taxonomy Biothings API code is avaiable at `<https://github.com/biothings/biothings.species>`_.
 
+.. note:: This tutorial was written for an older version of BioThings: some functions it uses no longer
+   exist, and the Hub no longer runs an SSH console. Before starting a Hub, read :doc:`hub_deployment`.
+
 Prerequesites
 ^^^^^^^^^^^^^
 
@@ -44,10 +47,11 @@ Finally, BioThings SDK is written in python, so you must know some basics.
 Configuration file
 ^^^^^^^^^^^^^^^^^^
 
-Before starting to implement our hub, we first need to define a configuration file. A
-`config_hub.py <https://github.com/biothings/biothings.species/blob/master/src/config_hub.py>` file
-contains all the required configuration variables, some **have** to be defined in your own application, other
-**can** be overriden as needed.
+Before starting to implement our hub, we first need to define a configuration file. This
+`default_config.py <https://github.com/biothings/biothings.api/blob/master/biothings/hub/default_config.py>` file
+contains all the required and optional configuration variables, some **have** to be defined in your own application, other
+**can** be overriden as needed (see `config_hub.py <https://github.com/biothings/biothings.species/blob/master/src/config_hub.py>`
+for an example).
 
 Typically we will have to define the following:
 

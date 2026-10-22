@@ -18,55 +18,49 @@ biothings.web.handlers.BaseAPIHandler
     - default common http headers (CORS and Cache Control)
 
 """
-import json
 import logging
 
 import yaml
+from tornado.web import HTTPError, RequestHandler
+
 from biothings.utils import serializer
 from biothings.web.analytics.events import Event
 from biothings.web.analytics.notifiers import AnalyticsMixin
 from biothings.web.options import OptionError, ReqArgs
-from tornado.escape import json_decode
-from tornado.web import HTTPError, RequestHandler
-
-try:
-    from raven.contrib.tornado import SentryMixin
-except ImportError:
-    class SentryMixin():
-        """dummy mixin"""
 
 logger = logging.getLogger(__name__)
 
-class BaseHandler(SentryMixin, RequestHandler):
 
+class BaseHandler(RequestHandler):
     @property
     def biothings(self):
         return self.application.biothings
 
-    def get_sentry_client(self):
-        # Override and retrieve from tornado settings instead.
-        client = self.settings.get('sentry_client')
-        if not client:  # need to set config.SENTRY_CLIENT_KEY
-            raise ValueError("Sentry Not Configured.")
-        return client
-
 
 class BaseAPIHandler(BaseHandler, AnalyticsMixin):
-
-    name = '__base__'
+    name = "__base__"
     kwargs = {
-        '*': {
-            'format': {
-                'type': str,
-                'default': 'json',
-                'enum': ('json', 'yaml', 'html', 'msgpack'),
+        "*": {
+            "format": {
+                "type": str,
+                "default": "json",
+                "enum": ("json", "yaml", "html", "msgpack"),
             }
         }
     }
-    format = 'json'
-    cache = 604800  # 7 days
+    format = "json"
+    cache = None
+    cache_control_template = "max-age={cache}, public"
 
-    def initialize(self):
+    def initialize(self, cache=None):
+        cache_value = self.biothings.config.DEFAULT_CACHE_MAX_AGE
+        if self.cache is not None:
+            cache_value = self.cache
+        if cache is not None:
+            cache_value = cache
+        # self._header has already set when call set_default_headers func before
+        # so we need to overwrite it to make custom cache age works
+        self.set_cache_header(cache_value)
 
         self.args = {}  # processed args will be available here
         self.args_query = {}  # query parameters in the URL
@@ -81,53 +75,68 @@ class BaseAPIHandler(BaseHandler, AnalyticsMixin):
         # self.event may be replaced with its sub-classes.
 
     def prepare(self):
-
-        content_type = self.request.headers.get('Content-Type', '')
-        if content_type.startswith('application/json'):
+        content_type = self.request.headers.get("Content-Type", "")
+        if content_type.startswith("application/json"):
             self.args_json = self._parse_json()
-        elif content_type.startswith('application/yaml'):
+        elif content_type.startswith("application/yaml"):
             self.args_yaml = self._parse_yaml()
 
-        self.args_query = {
-            key: self.get_query_argument(key)
-            for key in self.request.query_arguments}
-        self.args_form = {
-            key: self.get_body_argument(key)
-            for key in self.request.body_arguments}
+        self.args_query = {key: self.get_query_argument(key) for key in self.request.query_arguments}
+        self.args_form = {key: self.get_body_argument(key) for key in self.request.body_arguments}
 
         reqargs = ReqArgs(
-            ReqArgs.Path(
-                args=self.path_args,
-                kwargs=self.path_kwargs),
+            ReqArgs.Path(args=self.path_args, kwargs=self.path_kwargs),
             query=self.args_query,
             form=self.args_form,
-            json_=self.args_json
+            json_=self.args_json,
         )
         # standardized request arguments
         self.args = self._parse_args(reqargs)
-        self.format = self.args.format
+
+        # Handle cases where args is a plain dict (e.g., when name is missing or None)
+        if hasattr(self.args, 'format'):
+            self.format = self.args.format
+        else:
+            # Use the default format when args doesn't have format attribute
+            self.format = "json"
 
     def _parse_json(self):
         if not self.request.body:
-            raise HTTPError(400, reason=(
-                'Empty body is not a valid JSON. '
-                'Remove the content-type header, or '
-                'provide an empty object in the body.'))
+            return {}
         try:
-            return json_decode(self.request.body)
-        except json.JSONDecodeError:
-            raise HTTPError(400, reason='Invalid JSON body.')
+            return serializer.load_json(self.request.body)
+        except serializer.JSONDecodeError:
+            raise HTTPError(400, reason="Invalid JSON body.")
 
     def _parse_yaml(self):
         try:
             return yaml.load(self.request.body, Loader=yaml.SafeLoader)
         except (yaml.scanner.ScannerError, yaml.parser.ParserError):
-            raise HTTPError(400, reason='Invalid YAML body.')
+            raise HTTPError(400, reason="Invalid YAML body.")
 
     def _parse_args(self, reqargs):
-
         if not self.name:  # feature disabled
             return {}  # default value
+
+        # Check if handler defines kwargs but not a unique name - this is an error
+        if self.name == "__base__" and self.__class__ != BaseAPIHandler:
+            # Check if this handler defines its own kwargs (not inherited from BaseAPIHandler)
+            handler_has_kwargs = (
+                hasattr(self.__class__, 'kwargs') and
+                self.__class__.kwargs is not BaseAPIHandler.kwargs
+            )
+
+            if handler_has_kwargs:
+                # Handler defines kwargs but uses default name - this will cause conflicts
+                raise ValueError(
+                    f"Handler {self.__class__.__name__} defines 'kwargs' but doesn't define "
+                    f"a unique 'name' attribute. This causes parameter validation conflicts. "
+                    f"Please add: name = 'your_handler_name' to the class definition."
+                )
+            else:
+                # Handler doesn't define kwargs and doesn't define name - this is ok
+                # Return empty args to disable parameter validation
+                return {}
 
         optionsets = self.biothings.optionsets
         optionset = optionsets.get(self.name)
@@ -143,15 +152,10 @@ class BaseAPIHandler(BaseHandler, AnalyticsMixin):
             return args
 
         finally:  # one log message regardless of success
-            logger.debug(
-                "%s %s\n%s\n%s",
-                self.request.method,
-                self.request.uri,
-                reqargs, args)
+            logger.debug("%s %s\n%s\n%s", self.request.method, self.request.uri, reqargs, args)
 
     def write(self, chunk):
         try:
-
             if self.format == "json":
                 chunk = serializer.to_json(chunk)
                 self.set_header("Content-Type", "application/json; charset=UTF-8")
@@ -165,7 +169,7 @@ class BaseAPIHandler(BaseHandler, AnalyticsMixin):
                 self.set_header("Content-Type", "application/x-msgpack")
 
             elif self.format == "html":
-                chunk = self.render_string("api.html", data=json.dumps(chunk))
+                chunk = self.render_string("api.html", data=serializer.to_json(chunk))
                 self.set_header("Content-Type", "text/html; charset=utf-8")
 
         except Exception as exc:
@@ -179,6 +183,7 @@ class BaseAPIHandler(BaseHandler, AnalyticsMixin):
         # APIs should not normally need to use templating
         # set the path to where we can find the api.html
         import biothings.web.templates
+
         return next(iter(biothings.web.templates.__path__))
 
     def on_finish(self):
@@ -204,41 +209,41 @@ class BaseAPIHandler(BaseHandler, AnalyticsMixin):
         }
         """
 
-        reason = kwargs.pop('reason', self._reason)
+        reason = kwargs.pop("reason", self._reason)
         # "reason" is a reserved tornado keyword
         # see RequestHandler.send_error
         assert isinstance(reason, str)
-        assert '\n' not in reason
+        assert "\n" not in reason
 
-        message = {
-            "code": status_code,
-            "success": False,
-            "error": reason
-        }
+        message = {"code": status_code, "success": False, "error": reason}
         try:  # merge exception info
-            exception = kwargs['exc_info'][1]
-            message.update(exception.args[0]) # <-
-        except:
+            logger.debug("", exc_info=kwargs["exc_info"])  # log the full traceback in debug mode
+            exception = kwargs["exc_info"][1]
+            if isinstance(exception.args[0], dict):
+                message.update(exception.args[0])
+            elif isinstance(exception.args[0], str):
+                message["details"] = exception.args[0]
+        except Exception:
             pass
 
         self.finish(message)
 
     def options(self, *args, **kwargs):
-
         self.set_status(204)
         self.finish()
 
     def set_default_headers(self):
-
         self.set_header("Access-Control-Allow-Origin", "*")
         self.set_header("Access-Control-Allow-Methods", "*")
         self.set_header("Access-Control-Allow-Headers", "*")
         self.set_header("Access-Control-Allow-Credentials", "false")
         self.set_header("Access-Control-Max-Age", "60")
 
-        if self.cache and isinstance(self.cache, int):
+    def set_cache_header(self, cache_value):
+        if isinstance(cache_value, int):
             # https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cache-Control
-            self.set_header("Cache-Control", f"max-age={self.cache}, public")
-
-        # to disable caching for a handler, set cls.cache to 0 or
-        # run self.clear_header('Cache-Control') in an HTTP method
+            # to disable caching for a handler, set cls.cache to 0 or
+            # run self.clear_header('Cache-Control') in an HTTP method
+            # or set cache value on the config file:
+            # r"/api/query/?", "biothings.web.handlers.QueryHandler", {"biothing_type": "schema", "cache": 0}),
+            self.set_header("Cache-Control", self.cache_control_template.format(cache=cache_value))

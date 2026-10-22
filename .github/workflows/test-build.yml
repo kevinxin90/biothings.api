@@ -3,7 +3,7 @@ name: Build
 on:
   push:
     branches:
-    - master
+      - master
 
 jobs:
   build_package:
@@ -11,15 +11,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: [ 3.6, 3.7, 3.8, 3.9 ]
+        python-version: [ '3.11', '3.12', '3.13', '3.14', '3.14t' ]
     steps:
       - name: Checkout source
-        uses: actions/checkout@v2
+        uses: actions/checkout@v5
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
-        run: pip install wheel
+        run: pip install build
       - name: Build wheel
-        run: python setup.py sdist bdist_wheel
+        run: python -m build

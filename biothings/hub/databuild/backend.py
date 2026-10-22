@@ -1,44 +1,47 @@
-'''
+"""
 Backend for storing merged genedoc after building.
 Support MongoDB, ES, CouchDB
-'''
+"""
+
 import os
 from functools import partial
-from biothings.utils.common import get_timestamp, get_random_string
-from biothings.utils.backend import DocBackendBase, DocMongoBackend, DocESBackend
-from biothings.utils.es import ESIndexer
+
 import biothings.utils.mongo as mongo
+from biothings.utils.backend import DocBackendBase, DocESBackend, DocMongoBackend
+from biothings.utils.common import get_random_string, get_timestamp
+from biothings.utils.dataload import merge_struct
+from biothings.utils.es import ESIndexer
 from biothings.utils.hub_db import get_source_fullname, get_src_build
 
 
 # Source specific backend (deals with build config, master docs, etc...)
 class SourceDocBackendBase(DocBackendBase):
     def __init__(self, build_config, build, master, dump, sources):
-        if type(build_config) == partial:
+        if isinstance(build_config, partial):
             self._build_config_provider = build_config
             self._build_config = None
         else:
             self._build_config_provider = None
             self._build_config = build_config
-        if type(build) == partial:
+        if isinstance(build, partial):
             self._build_provider = build
             self._build = None
         else:
             self._build_provider = None
             self._build = build
-        if type(master) == partial:
+        if isinstance(master, partial):
             self._master_provider = master
             self._master = None
         else:
             self._master_provider = None
             self._master = master
-        if type(dump) == partial:
+        if isinstance(dump, partial):
             self._dump_provider = dump
             self._dump = None
         else:
             self._dump_provider = None
             self._dump = dump
-        if type(sources) == partial:
+        if isinstance(sources, partial):
             self._sources_provider = sources
             self._sources = None
         else:
@@ -89,8 +92,7 @@ class TargetDocBackend(DocBackendBase):
         Create/prepare a target backend, either strictly named "target_name"
         or named derived from "build_name" (for temporary backends)
         """
-        self._target_name = target_name or self.generate_target_name(
-            build_name)
+        self._target_name = target_name or self.generate_target_name(build_name)
 
     @property
     def target_name(self):
@@ -98,8 +100,7 @@ class TargetDocBackend(DocBackendBase):
 
     def generate_target_name(self, build_config_name):
         assert build_config_name is not None
-        return '{}_{}_{}'.format(build_config_name, get_timestamp(),
-                                 get_random_string()).lower()
+        return "{}_{}_{}".format(build_config_name, get_timestamp(), get_random_string()).lower()
 
     def get_backend_url(self):
         """
@@ -114,7 +115,7 @@ class TargetDocBackend(DocBackendBase):
 
 class SourceDocMongoBackend(SourceDocBackendBase):
     def get_build_configuration(self, build_name):
-        self._config = self.build_config.find_one({'_id': build_name})
+        self._config = self.build_config.find_one({"_id": build_name})
         return self._config
 
     def validate_sources(self, sources=None):
@@ -122,8 +123,7 @@ class SourceDocMongoBackend(SourceDocBackendBase):
 
     def get_src_master_docs(self):
         if self.src_masterdocs is None:
-            self.src_masterdocs = dict([(src['_id'], src)
-                                        for src in list(self.master.find())])
+            self.src_masterdocs = dict([(src["_id"], src) for src in list(self.master.find())])
         return self.src_masterdocs
 
     def get_src_metadata(self):
@@ -154,21 +154,55 @@ class SourceDocMongoBackend(SourceDocBackendBase):
             # are sub-source names, not main source so we have to deal with src_dump as well
             # in order to resolve/map main/sub source name
             subsrc_versions = []
+
+            if src and src.get("download"):
+                # Store the latest success dump time
+                src_meta.setdefault(src["_id"], {})
+                last_success = src["download"].get("last_success")
+                if not last_success and src["download"].get("status") == "success":
+                    last_success = src["download"].get("started_at")
+                if last_success:
+                    src_meta[src["_id"]]["download_date"] = last_success
+
             if src and src.get("upload"):
+                latest_upload_date = None
                 meta = {}
+                # collect each sub-source's field mapping (from src_master) so they can be
+                # merged into a single mapping stored at the main-source level below
+                sub_mappings = []
                 for job_name in src["upload"].get("jobs", {}):
                     job = src["upload"]["jobs"][job_name]
                     # "step" is the actual sub-source name
-                    docm = self.master.find_one({"_id": job.get("step")})
+                    sub_source = job.get("step")
+                    docm = self.master.find_one({"_id": sub_source})
+                    # store the src_meta for each sub-source, if any.
                     if docm and docm.get("src_meta"):
-                        meta[job.get("step")] = docm["src_meta"]
+                        meta[sub_source] = docm["src_meta"]
+                    if docm and docm.get("mapping"):
+                        sub_mappings.append(docm["mapping"])
+                    # Store the latest success upload time
+                    if not latest_upload_date or latest_upload_date < job["started_at"]:
+                        step_meta = meta.setdefault(sub_source, {})
+                        sub_source_info = src["upload"]["jobs"][sub_source]
+                        last_success = sub_source_info.get("last_success")
+                        if not last_success and sub_source_info.get("status") == "success":
+                            last_success = sub_source_info.get("started_at")
+                        if last_success:
+                            step_meta["upload_date"] = last_success
+
                 # when more than 1 sub-sources, we can have different version in sub-sources
                 # (not normal) if one sub-source uploaded, then dumper downloaded a new version,
                 # then the other sub-source uploaded that version. This should never happen, just make sure
-                subsrc_versions = [{"sub-source": job.get("step"), "version": job.get("release")}
-                                   for job in src["upload"].get("jobs", {}).values()]
-                assert len(set([s["version"] for s in subsrc_versions])) == 1, "Expecting one version " + \
-                    "in upload sub-sources for main source '%s' but got: %s" % (src["_id"], subsrc_versions)
+                subsrc_versions = [
+                    {"sub-source": job.get("step"), "version": job.get("release")}
+                    for job in src["upload"].get("jobs", {}).values()
+                ]
+                assert (
+                    len(set([s["version"] for s in subsrc_versions])) == 1
+                ), "Expecting one version " + "in upload sub-sources for main source '%s' but got: %s" % (
+                    src["_id"],
+                    subsrc_versions,
+                )
                 # usually, url & license are the same wathever the sub-sources are. They are
                 # share common metadata, and we don't want them to be repeated for each sub-sources.
                 # but, code key is always different for instance and must specific for each sub-sources
@@ -178,10 +212,7 @@ class SourceDocMongoBackend(SourceDocBackendBase):
                     any = list(meta)[0]
                     topop = []  # common keys
                     for anyk in meta[any]:
-                        if len({
-                                meta[s].get(anyk) == meta[any][anyk]
-                                for s in meta
-                        }) == 1:
+                        if len({meta[s].get(anyk) == meta[any][anyk] for s in meta}) == 1:
                             topop.append(anyk)
                     for k in topop:
                         common[k] = meta[any][k]
@@ -191,26 +222,32 @@ class SourceDocMongoBackend(SourceDocBackendBase):
                         src_meta.setdefault(src["_id"], {}).setdefault(k, v)
                     for subname in meta:
                         for k, v in meta[subname].items():
-                            src_meta.setdefault(src["_id"], {}).setdefault(
-                                k, {}).setdefault(subname, v)
+                            src_meta.setdefault(src["_id"], {}).setdefault(k, {}).setdefault(subname, v)
                 # we have metadata, but just one (ie. no sub-source), don't display it
                 elif meta:
                     assert len(meta) == 1
                     subname, metad = meta.popitem()
                     for k, v in metad.items():
                         src_meta.setdefault(src["_id"], {}).setdefault(k, v)
+
+                # merge all sub-source field mappings into a single mapping stored at the
+                # main-source level (_meta.src.<source>.mapping). For multi-uploader sources
+                # the individual uploader mappings are merged together into one.
+                if sub_mappings:
+                    merged_mapping = sub_mappings[0]
+                    for mapping in sub_mappings[1:]:
+                        merged_mapping = merge_struct(merged_mapping, mapping)
+                    src_meta.setdefault(src["_id"], {})["mapping"] = merged_mapping
             if subsrc_versions:
                 version = subsrc_versions[0]["version"]
-                src_version[src['_id']] = version
-                src_meta.setdefault(src["_id"],
-                                    {}).setdefault("version", version)
+                src_version[src["_id"]] = version
+                src_meta.setdefault(src["_id"], {}).setdefault("version", version)
         return src_meta
 
 
 class TargetDocMongoBackend(TargetDocBackend, DocMongoBackend):
     def set_target_name(self, target_name=None, build_name=None):
-        super(TargetDocMongoBackend,
-              self).set_target_name(target_name, build_name)
+        super(TargetDocMongoBackend, self).set_target_name(target_name, build_name)
         self.target_collection = self.target_db[self._target_name]
 
 
@@ -219,9 +256,7 @@ class ShardedTargetDocMongoBackend(TargetDocMongoBackend):
         assert self.target_name, "target_name not set"
         assert self.target_db, "target_db not set"
         dba = self.target_db.client.admin
-        dba.command("shardCollection",
-                    "%s.%s" % (self.target_db.name, self.target_name),
-                    key={"_id": "hashed"})
+        dba.command("shardCollection", "%s.%s" % (self.target_db.name, self.target_name), key={"_id": "hashed"})
 
 
 class LinkTargetDocMongoBackend(TargetDocBackend):
@@ -233,7 +268,8 @@ class LinkTargetDocMongoBackend(TargetDocBackend):
     merge. This is useful when "merging/indexing" only one datasource,
     where the merge step is just a duplication of datasource data.
     """
-    name = 'link'
+
+    name = "link"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -273,63 +309,45 @@ def create_backend(db_col_names, name_only=False, follow_ref=False, **kwargs):
     col = None
     db = None
     is_mongo = True
-    if type(db_col_names) == str:
+    if isinstance(db_col_names, str):
         # first check build doc, if there's backend_url key, we'll use it instead of
-        # direclty using db_col_names as target collection (see LinkDataBuilder)
+        # directly using db_col_names as target collection (see LinkDataBuilder)
         bdoc = get_src_build().find_one({"_id": db_col_names})
-        if follow_ref and bdoc and bdoc.get(
-                "backend_url") and bdoc["backend_url"] != db_col_names:
-            return create_backend(bdoc["backend_url"],
-                                  name_only=name_only,
-                                  follow_ref=follow_ref,
-                                  **kwargs)
+        if follow_ref and bdoc and bdoc.get("backend_url") and bdoc["backend_url"] != db_col_names:
+            return create_backend(bdoc["backend_url"], name_only=name_only, follow_ref=follow_ref, **kwargs)
         else:
             db = mongo.get_target_db()
             col = db[db_col_names]
             # normalize params
-            db_col_names = [
-                "%s:%s" % (db.client.HOST, db.client.PORT), db.name, col.name
-            ]
+            db_col_names = ["%s:%s" % (db.client.HOST, db.client.PORT), db.name, col.name]
     elif db_col_names[0].startswith("mongodb://"):
-        assert len(
-            db_col_names
-        ) == 3, "Missing connection information for %s" % repr(db_col_names)
-        conn = mongo.MongoClient(db_col_names[0])
+        assert len(db_col_names) == 3, "Missing connection information for %s" % repr(db_col_names)
+        conn = mongo._cached_client(db_col_names[0])
         db = conn[db_col_names[1]]
         col = db[db_col_names[2]]
         # normalize params
-        db_col_names = [
-            "%s:%s" % (db.client.HOST, db.client.PORT), db.name, col.name
-        ]
+        db_col_names = ["%s:%s" % (db.client.HOST, db.client.PORT), db.name, col.name]
     elif len(db_col_names) == 3 and ":" in db_col_names[0]:
         is_mongo = False
-        idxr = ESIndexer(index=db_col_names[1],
-                         doc_type=db_col_names[2],
-                         es_host=db_col_names[0],
-                         **kwargs)
+        idxr = ESIndexer(
+            index=db_col_names[1],
+            es_host=db_col_names[0],
+            **kwargs,
+        )
         db = idxr
         col = db_col_names[1]
     else:
-        assert len(
-            db_col_names
-        ) == 2, "Missing connection information for %s" % repr(db_col_names)
-        db = db_col_names[0] == "target" and mongo.get_target_db(
-        ) or mongo.get_src_db()
+        assert len(db_col_names) == 2, "Missing connection information for %s" % repr(db_col_names)
+        db = db_col_names[0] == "target" and mongo.get_target_db() or mongo.get_src_db()
         col = db[db_col_names[1]]
         # normalize params (0:host, 1:port)
-        db_col_names = [
-            "%s:%s" % (db.client.address[0], db.client.address[1]), db.name,
-            col.name
-        ]
-    assert col is not None, "Could not create collection object from %s" % repr(
-        db_col_names)
+        db_col_names = ["%s:%s" % (db.client.HOST, db.client.PORT), db.name, col.name]
+    assert col is not None, "Could not create collection object from %s" % repr(db_col_names)
     if name_only:
         if is_mongo:
-            return "mongo_%s_%s_%s" % (db_col_names[0].replace(
-                ":", "_"), db_col_names[1], db_col_names[2])
+            return "mongo_%s_%s_%s" % (db_col_names[0].replace(":", "_"), db_col_names[1], db_col_names[2])
         else:
-            return "es_%s_%s_%s" % (db_col_names[0].replace(
-                ":", "_"), db_col_names[1], db_col_names[2])
+            return "es_%s_%s_%s" % (db_col_names[0].replace(":", "_"), db_col_names[1], db_col_names[2])
     else:
         if is_mongo:
             return DocMongoBackend(db, col)
@@ -355,8 +373,9 @@ def merge_src_build_metadata(build_docs):
     Ideally, build docs shouldn't have any sources in common to
     prevent any unexpected conflicts...
     """
-    assert type(build_docs) == list and len(build_docs) >= 2, \
-        "More than one build document must be passed in order metadata"
+    assert (
+        isinstance(build_docs, list) and len(build_docs) >= 2
+    ), "More than one build document must be passed in order metadata"
     first = build_docs[0]
     others = build_docs[1:]
     meta = first.setdefault("_meta", {})
@@ -364,7 +383,7 @@ def merge_src_build_metadata(build_docs):
         new_meta = new_doc.get("_meta", {})
         for k, v in new_meta.items():
             # src_version, src, stats: merge
-            if type(v) == dict:
+            if isinstance(v, dict):
                 meta.setdefault(k, {})
                 meta[k].update(v)
             # build_version, build_date: override

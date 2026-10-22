@@ -1,24 +1,363 @@
-v0.11.0
-    Added Authentication Mixin class for BioThings SDK Web.
-    Added GitHub and ORCID Mixin class for BioThings SDK Web.
+v1.2.2 (2026/10/22)
+    biothings.web improvements:
+        - Added the `QUERY_POST_MAX_HITS` setting (100,000 by default, `None` to turn it off), and POST `/query` now returns a 400 error when the number of query terms times `size` is over it. The error explains that `size` applies to each query term and gives the largest `size` that fits, and also suggests a species filter in APIs with a `species` parameter. A request without `size` counts as 10 hits per term. ([#482](https://github.com/biothings/biothings.api/pull/482))
+        - Changed the default `default_string_query` to build `q=*` as a `match_all` query instead of a `query_string` query. APIs that override `default_string_query` still receive `q=*` and build their own query for it. ([#484](https://github.com/biothings/biothings.api/pull/484), [#485](https://github.com/biothings/biothings.api/pull/485))
+        - Logged failed searches with status 400 in POST `/query` multisearch results as warnings instead of errors, so user errors that weren't on the list of known error reasons, such as sorting on a nested field, are no longer reported to Sentry. Failed searches with any other status are still logged at ERROR. ([#483](https://github.com/biothings/biothings.api/pull/483))
 
-v0.10.1
+v1.2.1 (2026/10/14)
+    biothings.hub improvements:
+        - Added an optional login to the Hub API. When users are defined in the new `HUB_API_USERS` setting, requests that run commands or change data (any method other than GET, HEAD, and OPTIONS) require a token from `POST /login`, sent in the `X-Biothings-Access-Token` header, and repeated failed logins are throttled per user. Without users, the API stays open as before. ([#480](https://github.com/biothings/biothings.api/pull/480))
+        - Removed the Hub's SSH console and dropped `asyncssh` from the `hub` extra. `HUB_SSH_PORT` and `HUB_PASSWD` are now ignored with a warning, and the console's commands can be run from BioThings Studio's terminal. ([#480](https://github.com/biothings/biothings.api/pull/480))
+        - Sped up build diffs by checking which IDs exist in the old collection without loading their documents, loading both sides of a MongoDB comparison in parallel, and pairing documents by ID instead of by sort order. Diffs now raise an error when a backend returns duplicate or mismatched document IDs instead of comparing the wrong documents. ([#473](https://github.com/biothings/biothings.api/pull/473))
+        - Fixed JobManager's pending-job count with free-threaded workers, which counted idle worker threads as running jobs, and kept a cancelled process job counted until its worker actually stops. ([#473](https://github.com/biothings/biothings.api/pull/473))
+
+    biothings.web improvements:
+        - Added `search_after` pagination with an Elasticsearch point in time to `GET /query`. `search_after=*` starts a session, each page returns a `_search_after` cursor for the next page, and unlike `fetch_all`, `sort` is honored. ([#474](https://github.com/biothings/biothings.api/pull/474))
+        - Deprecated scroll pagination with `fetch_all` and `scroll_id`, which keeps working and now adds a `_warning` recommending `search_after` to its responses. ([#474](https://github.com/biothings/biothings.api/pull/474))
+
+    biothings.utils improvements:
+        - Sped up unordered list comparison in `jsondiff`, and fixed lists holding the same values with different multiplicities being reported as equal. ([#473](https://github.com/biothings/biothings.api/pull/473))
+        - Added `python -m biothings.utils.passwords` to create the password hashes used in `HUB_API_USERS`. ([#480](https://github.com/biothings/biothings.api/pull/480))
+        - Fixed `biothings.utils.diff.get_backend` building MongoDB backends from a collection instead of its database and rejecting the backend's own `mongo` type name. ([#473](https://github.com/biothings/biothings.api/pull/473))
+
+    Misc improvements:
+        - Added a Hub deployment and access-control guide covering the API login and HTTPS. ([#480](https://github.com/biothings/biothings.api/pull/480))
+        - Added a JSON diff workload to the JobManager benchmark. ([#473](https://github.com/biothings/biothings.api/pull/473))
+
+v1.2.0 (2026/10/08)
+    Highlights:
+        - Required Python 3.11 or newer and dropped support for Python 3.9 and 3.10.
+        - Migrated Hub job handling and data pipelines to structured asyncio concurrency.
+        - Added opt-in free-threaded (no-GIL) Hub workers for free-threaded Python builds.
+        - Replaced orjson with msgspec for JSON serialization.
+        - Added optional index-time aliasing to speed up `_exists_` queries on large object fields.
+
+    biothings.hub improvements:
+        - Migrated JobManager job submission and the dump, upload, build, diff, sync, index, snapshot, inspect, and publish pipelines to `asyncio.TaskGroup` and awaited steps. A failed job now cancels its sibling jobs, and semaphores no longer leak when job admission or a download fails. ([#458](https://github.com/biothings/biothings.api/pull/458))
+        - Added the `HUB_FREE_THREADED_WORKERS` setting, which runs CPU-bound merge, diff, and upload jobs in threads instead of forked processes on free-threaded Python builds. ([#458](https://github.com/biothings/biothings.api/pull/458))
+        - Fixed file descriptor leaks that could crash the Hub with "Too many open files" by caching MongoDB and Elasticsearch clients per process, reusing them across indexing batches, and closing archive file handles in the dump and upload helpers. ([#458](https://github.com/biothings/biothings.api/pull/458), [#465](https://github.com/biothings/biothings.api/pull/465))
+        - Fixed `flatten_inspection_data` failing on running or failed inspection jobs, and quick index failing with `No such builder` after an inspected mapping was saved. ([#463](https://github.com/biothings/biothings.api/pull/463))
+        - Added an optional post-index scan, enabled with the `exists_field_alias_scan` build config option, that stores `_exists_` field aliases in index metadata. ([#469](https://github.com/biothings/biothings.api/pull/469))
+        - Stored a merged field mapping for each source, including multi-uploader sources, in build metadata. ([#454](https://github.com/biothings/biothings.api/pull/454))
+        - Fixed DataTransform nested lookups through lists of dicts to resolve the rest of the path in every item, so deeper paths return all of their values and non-dictionary intermediate values no longer raise errors. ([#458](https://github.com/biothings/biothings.api/pull/458), [44f1bf3](https://github.com/biothings/biothings.api/commit/44f1bf3288160f6493e5f24c17d4f27031db2a64))
+        - Replaced the `unprepare()` and `prepare(state)` pickling workaround with `__getstate__` in dumpers, uploaders, and DataTransform edges, and removed `unprepare()` from builders. ([ec7eb9b](https://github.com/biothings/biothings.api/commit/ec7eb9b9cb87c993a22ff3af75b3b3fb54b052a5))
+        - Logged a warning instead of raising an error when a registered dumper has no `SCHEDULE`. ([#470](https://github.com/biothings/biothings.api/pull/470))
+        - Fixed the source name missing from source registration warnings. ([77c876b](https://github.com/biothings/biothings.api/commit/77c876b720f54d83b94a64c7349988e02e3ee34b))
+
+    biothings.web improvements:
+        - Annotated `/metadata/fields` entries with the sources that define them, and listed each source's fields in `/metadata` only in development mode. ([#454](https://github.com/biothings/biothings.api/pull/454))
+        - Rewrote `_exists_` clauses in `q`, `filter`, and `post_filter` query strings to use the field aliases stored in index metadata. ([#469](https://github.com/biothings/biothings.api/pull/469))
+
+    biothings.utils improvements:
+        - Replaced orjson with msgspec in `biothings.utils.serializer`. Public functions keep their signatures, `orjson_default` remains as a deprecated alias of `json_enc_hook`, and non-string dictionary keys are still converted to strings. `serializer.JSONDecodeError` now aliases `msgspec.DecodeError`, and naive datetimes are encoded without a `+00:00` suffix. ([#458](https://github.com/biothings/biothings.api/pull/458))
+        - Replaced deprecated `asyncio.get_event_loop()` and `asyncio.ensure_future()` calls with `get_loop()` and `loop.create_task()`, and added a `first_exception()` helper for unwrapping exception groups. ([#458](https://github.com/biothings/biothings.api/pull/458))
+
+    Misc improvements:
+        - Updated CI to test Python 3.11 through 3.14 and free-threaded 3.14t, and removed dependency markers and backports for unsupported Python versions. ([#458](https://github.com/biothings/biothings.api/pull/458))
+        - Capped `aiohttp` below 3.14 in the `dev` extra until `aioresponses` supports it. ([#458](https://github.com/biothings/biothings.api/pull/458))
+        - Added a JobManager benchmark comparing process and free-threaded workers. ([#458](https://github.com/biothings/biothings.api/pull/458))
+        - Fixed missing code blocks in the Studio tutorial. ([de7a60c](https://github.com/biothings/biothings.api/commit/de7a60caa7069fe7d90231c4bfcc859ecec7f6f8))
+
+v1.1.4 (2026/09/10)
+    biothings.web improvements:
+        - Rejected `_id` as a sort or aggregation field with an actionable error message instead of an Elasticsearch fielddata failure. ([1747825](https://github.com/biothings/biothings.api/commit/17478250478b8e45458b56ca0ca8f8fa174ced97))
+        - Reduced Sentry noise for Elasticsearch query-parse failures caused by malformed user queries, covering both single-node and multi-node cluster error shapes. ([#466](https://github.com/biothings/biothings.api/pull/466), [9d71063](https://github.com/biothings/biothings.api/commit/9d710634c71d9a8580901fc46f138a10e5903775))
+        - Limited POST query batches to a maximum of 5000 query terms. ([e733d28](https://github.com/biothings/biothings.api/commit/e733d28987b7ca5f67347573c2b584f4cd146537))
+        - Lowered query-object parser logging from INFO to DEBUG. ([9d71063](https://github.com/biothings/biothings.api/commit/9d710634c71d9a8580901fc46f138a10e5903775))
+
+    Misc improvements:
+        - Added tests covering POST query batch limits. ([c5e00b8](https://github.com/biothings/biothings.api/commit/c5e00b88daaedca4f65ce6c5220b5a918887088f))
+
+v1.1.3 (2026/08/13)
+    biothings.web improvements:
+        - Reduced Sentry noise for known Elasticsearch mapping errors by logging them below ERROR while preserving error reporting for unexpected responses. ([3257d21](https://github.com/biothings/biothings.api/commit/3257d212baca228164318339157e84dd40daf8df), [371122c](https://github.com/biothings/biothings.api/commit/371122c78121c742e1608dddbd5edc79b27c575c))
+        - Added query-builder validation for Elasticsearch's maximum result window and improved random-query pagination and `_score` sort guidance. ([30112da](https://github.com/biothings/biothings.api/commit/30112da5bc0827c05ca51d162cfed07c17169203))
+
+    Misc improvements:
+        - Added standardized release instructions and a cross-agent release skill for maintainers. ([#457](https://github.com/biothings/biothings.api/pull/457))
+        - Added a Docker Compose test stack for local Elasticsearch and MongoDB services. ([a2b21ea](https://github.com/biothings/biothings.api/commit/a2b21ead7baf0b108c54accd97e6ea0aa8773cbc))
+
+v1.1.2 (2026/07/23)
+    biothings.hub improvements:
+        - Added index recovery modes for resume and purge workflows, including mode metadata, job-state context, batched missing-ID checks, and client cleanup. ([#453](https://github.com/biothings/biothings.api/pull/453))
+        - Fixed index lookup compatibility for indexes whose metadata stores counts as `total_documents`. ([#453](https://github.com/biothings/biothings.api/pull/453))
+
+    biothings.web improvements:
+        - Fixed POST raw query handling so multisearch raw results are returned without assuming a single response body.
+        - Added sort syntax validation and clearer Elasticsearch error messages for invalid fields or unsupported `field:order` sort input.
+        - Fixed list minimum validation and FormatterDict.include() behavior. ([#452](https://github.com/biothings/biothings.api/pull/452))
+
+    Misc improvements:
+        - Avoided network calls when detecting GitHub data plugin assistant URLs. ([#453](https://github.com/biothings/biothings.api/pull/453))
+        - Stabilized random query handler tests.
+
+v1.1.1 (2026/06/18)
+    biothings.hub improvements:
+        - Fixed index lifecycle registration so indexes are only marked ready after post-index steps complete. ([#449](https://github.com/biothings/biothings.api/pull/449))
+        - Fixed DataTransform nested lookup handling for lists of dictionaries and one-to-many API lookup results.
+
+    biothings.web improvements:
+        - Fixed GA4 analytics request context handling so referer and page location are propagated to custom events. ([#450](https://github.com/biothings/biothings.api/pull/450))
+        - Replaced risky Elasticsearch query assertions with explicit user-input validation. ([#447](https://github.com/biothings/biothings.api/pull/447))
+
+    Misc improvements:
+        - Fixed GA4 analytics channel tests for newer aiohttp behavior without relying on aioresponses internals. ([#448](https://github.com/biothings/biothings.api/pull/448))
+        - Updated the Elasticsearch dependency floor to 8.18+ for supported Python versions.
+
+v1.1.0 (2026/05/27)
+    Highlights:
+        - Added Python 3.14 support and dropped Python 3.8 support.
+        - Reworked biothings CLI configuration, pathing, and dataplugin command organization.
+        - Added MongoDB build cleanup management APIs and commands.
+
+    biothings.hub improvements:
+        - Added prefix support to DataTransformMDB. ([#411](https://github.com/biothings/biothings.api/pull/411))
+        - Added TAR and Zstandard file handling. ([#424](https://github.com/biothings/biothings.api/pull/424), [#428](https://github.com/biothings/biothings.api/pull/428))
+        - Added support for custom local uploader and dumper classes in dataplugin manifests. ([#431](https://github.com/biothings/biothings.api/pull/431))
+        - Added MongoDB build cleanup validation and deletion tooling. ([#437](https://github.com/biothings/biothings.api/pull/437))
+
+    biothings.utils improvements:
+        - Fixed dict_sweep handling for NaN-like values, including pandas.NA and pandas.NaT. ([#442](https://github.com/biothings/biothings.api/pull/442))
+        - Centralized orjson usage across the library. ([#435](https://github.com/biothings/biothings.api/pull/435))
+
+    biothings.web improvements:
+        - Removed deprecated Google Analytics event support. ([#439](https://github.com/biothings/biothings.api/pull/439))
+        - Removed old doc_type and deprecated Elasticsearch compatibility code.
+        - Improved Elasticsearch exception handling and query response behavior.
+        - Optimized Elasticsearch memory usage when using scroll API.
+
+    biothings.cli improvements:
+        - Added CLI config and pathing commands. ([#418](https://github.com/biothings/biothings.api/pull/418), [#422](https://github.com/biothings/biothings.api/pull/422))
+        - Added CLI dump mark-success support. ([#423](https://github.com/biothings/biothings.api/pull/423))
+        - Fixed Typer/rich_utils loading behavior. ([#426](https://github.com/biothings/biothings.api/pull/426))
+
+    Misc improvements:
+        - Updated dependencies and package metadata for Python 3.9+, including tornado, typer, pymongo, orjson, and zstandard.
+        - Updated GitHub Actions test, build, and publish workflows.
+
+v1.0.2 (2025/10/15)
+    Bugfix:
+        - Fixed an import issue in inspector.py that was causing the mapping inspect to fail.
+
+v1.0.1 (2025/08/21)
+    Bugfixes:
+        - Fixed parameter validation conflict by requiring handler classes with `kwargs` to define a unique `name` attribute. ([#412](https://github.com/biothings/biothings.api/pull/412))
+        - Fix missing dependencies for building sphinx docs
+
+v1.0.0 (2025/07/29)
+    Highlights:
+        - Support sqlite3 for the MergerStorage backend, e.g. used in CLI ([#348](https://github.com/biothings/biothings.api/pull/348))
+        - Support data validation after upload ([#348](https://github.com/biothings/biothings.api/pull/348))
+        - Consolidated "dataplugin" and "dataplugin_hub" CLI commands ([#391](https://github.com/biothings/biothings.api/pull/391))
+    biothings.hub improvements:
+        - Fixed utils.dataload.unlist helper function for handling nested lists or dictionaries ([#352](https://github.com/biothings/biothings.api/pull/352))
+        - Added MAX_PARALLEL_UPLOAD option in ParallelizedSourceUploader class to limit maximum parallel upload workers
+        - Added new SnapshotManager.validate_snapshots method  ([#355](https://github.com/biothings/biothings.api/pull/355))
+        - Added PostgreSQL as a supported backend ([#359](https://github.com/biothings/biothings.api/pull/359))
+        - Added DISABLED option in the BaseDumper class to allow disabling a plugin ([#396](https://github.com/biothings/biothings.api/pull/396))
+        - Support Pydantic based validation during the post_upload step ([#382](https://github.com/biothings/biothings.api/pull/382))
+        - Improve error logging when handling ElasticSearch BulkIndexError Exception ([#380](https://github.com/biothings/biothings.api/pull/380))
+        - Added validation schemas for the dataplugin manifest files ([#371](https://github.com/biothings/biothings.api/pull/371))
+        - Updated WgetDumper class to use subprocess instead of deprecated os.system
+    biothings.web improvements:
+        - Fixed the KeyError issue in JMESPath when jmespath_exclude_empty=true ([#372](https://github.com/biothings/biothings.api/pull/372))
+        - Fixed queries when "Content-Type" header exists but request body is empty ([#376](https://github.com/biothings/biothings.api/issues/376))
+        - Removed deprecated doc_type from ESIndex class ([#402](https://github.com/biothings/biothings.api/pull/402))
+        - Fixed a bug when calling /metadata, it overrides MetadataSourceHandler.biothing_type ([#393](https://github.com/biothings/biothings.api/issues/393))
+        - Suppressed the logs from the "elastic_transport.transport" logger ([#363](https://github.com/biothings/biothings.api/issues/363))
+    biothings.cli improvements:
+        - Added experimental "index" subcommand to "dataplugin" command ([#373](https://github.com/biothings/biothings.api/pull/373))
+        - Added experimental "validate" subcommand to "dataplugin" command ([#371](https://github.com/biothings/biothings.api/pull/371))
+        - Consolidated "dataplugin" and "dataplugin_hub" commands into a single "dataplugin" commmand ([#391](https://github.com/biothings/biothings.api/pull/391))
+    Misc improvements:
+        - Upgraded ElasticSearch to 8.17.0 ([#356](https://github.com/biothings/biothings.api/pull/356))
+        - Support Python 3.13 ([#356](https://github.com/biothings/biothings.api/pull/356))
+        - Overhauled biothings test infrastructure and discovery ([#397](https://github.com/biothings/biothings.api/pull/397))
+        - Improved biothings pytest architecture ([#350](https://github.com/biothings/biothings.api/pull/350))
+
+v0.12.5 (2024/07/21)
+    Highlights:
+        - Added options for Docker dumper (named) volumes
+        - Allow running web API tests directly in the hub settings
+        - Added advanced plugin support for Biothings CLI
+        - Support Python 3.12 and dropped Python 3.7 support
+    biothings.web improvements:
+        - Moved jmespath after other transformations (#323 #324 #325)
+        - Added metadata validation in our query builder
+        - Fixed the async HTTP client issues when sending GA4 notifications
+    biothings.hub improvements:
+        - Allow setting a custom config file to run test API in the hub
+        - Replaced deprecated imp module with importlib in plugin assistant
+        - Updated pymongo version to prevent log leaking
+    biothings.cli improvements:
+        - Added MongoDB backend support in Biothings CLI
+    biothings.utils improvements:
+        - Added proper handling for duplicate ID's in IgnoreDuplicateStorage
+        - Added more performant bulk document write for sqlite3 backend
+    Misc improvements:
+        - Upgraded Tornado to 6.4.1
+        - Corrected keyword argument for compability with elasticsearch 8.x client
+        - Fixed error handling for compability with elasticsearch 8.x client
+
+v0.12.4 (2024/04/02)
+    Highlights:
+        - New and updated tutorials and documentation
+        - CURIE id support in the annotation endpoint
+        - Added new jmespath_exclude_empty option
+    biothings.web improvements:
+        - Jmespath now handles list as parent_path field
+    biothings.hub improvements:
+        - Added Elasticsearch index selector
+    biothings.cli improvements:
+        - Fixed missing data plugin manifest template
+    documentation improvements:
+        - Added new tutorial for Biothings CLI
+        - Added tutorial for creating docker based data plugin
+    Misc improvements:
+        - Upgraded Tornado to 6.4.0
+        - Upgraded elasticsearch-py and elasticsearch-dsl to 8.x
+
+v0.12.3 (2023/10/31)
+    Highlights:
+        - Implemented the new filter parameter for the query handler (#296)
+    biothings.web improvements:
+        - Enabled post_filter parameter for POST queries (#208)
+        - Improved jmespath transformation with better support root-level transformation
+    biothings.hub improvements:
+        - Allow passing and customizing merge_struct with the new inclusion and exclustion parameters
+        - Allow customization in Builder's merge order with the new merge_order method
+        - Fixed the deprecated import of networkx module
+        - Fixed the security issue when calling check_output https://github.com/biothings/biothings.api/pull/301
+        - Switched to use orjson in utils.dotfield module https://github.com/biothings/biothings.api/pull/300
+        - Changed default release date format in DockerContainerDumper
+
+v0.12.2 (2023/07/17)
+    Bugfixes:
+        - 7e9583ec Fix dict default vals to work with dicts. (#292)
+        - 77c577cc Break Circular Dependency (#291)
+        - 7044abba Set plugin name to the folder name for Advanced plugins. (#290)
+
+v0.12.1 (2023/07/05)
+    Bugfixes:
+        - biothings.cli: fixed "logger is not defined" error when typer is not installed
+        - biothings.web: fixed an error when build_date is None during the metadata merging
+        - biothings.web: fixed an edge case when attempting to read ES6 mapping with doc_type
+
+v0.12.0 (2023/06/21)
+    Highlights:
+        - New CLI feature for developing and testing data plugins https://github.com/newgene/biothings.api/pull/56
+        - New Docker Dumper based data plugins https://github.com/newgene/biothings.api/pull/83
+        - Support manifest-only date plugin (with a pre-defined parser) https://github.com/biothings/biothings.api/issues/259
+        - Support Python 3.11 and dropped Python 3.6 support
+
+    biothings.web improvements
+        - Support Google Analytics 4 https://github.com/newgene/biothings.api/pull/16
+        - Added a new `jmespath` query parameter for response transformation https://github.com/biothings/biothings.api/commit/31898fac7cd86b5c05520622885a3c0852f2494c
+        - Added date_format query parameter validation https://github.com/newgene/biothings.api/pull/97
+        - Added min for numeric query parameter validation (max is already supported) https://github.com/newgene/biothings.api/pull/97
+        - Fixed tornado.autoreload issue to support task-based reload hook https://github.com/newgene/biothings.api/pull/95
+        - Prevent biothing_type field in metadata from returning a single-item list https://github.com/biothings/biothings.api/issues/272
+        - Fixed the response formatter for histogram aggregation results https://github.com/biothings/biothings.api/issues/267
+        - Fixed an issue when only ES_INDEX is provided, not ES_DOC_TYPE https://github.com/biothings/biothings.api/commit/5c6d6dc6057073fb040dd7ae5b11b1b9967bf4f4
+        - Retired the use of pyinotify in autoreloader https://github.com/biothings/biothings.api/issues/260
+        - Logging all hanlders at server start https://github.com/biothings/biothings.api/commit/e9b3f9e6f8761746eb1e6f476dd9500b8bf8fe0e
+        - Adjusted sentry traces_sample_rate setting for better tracking tracebacks https://github.com/biothings/biothings.api/commit/eec03385e79394d1d99a7ed8537966ce2e995645
+
+    biothings.hub improvements
+        - New CLI feature for developing and testing data plugins https://github.com/newgene/biothings.api/pull/56
+        - New Docker Dumper based data plugins https://github.com/newgene/biothings.api/pull/83
+        - Support multiple target Elasticsearch hosts in data releases https://github.com/biothings/biothings.api/issues/251
+        - Allow to set AUTOHUB_VALIDATOR_CLASS to customize release validation logic https://github.com/newgene/biothings.api/pull/105
+        - Allow to override AutoHubFeature.validate_release method to add metadata validation https://github.com/biothings/biothings.api/issues/284
+        - Allow to manually mark a data source dump as success, e.g. manual downloads https://github.com/newgene/biothings.api/pull/101
+        - Verify existing snapshot config matches SNAPSHOT_CONFIG setting and allow to recreate if needed https://github.com/biothings/biothings.api/issues/275
+        - Support addtional filters (e.g. status) for the build list https://github.com/newgene/biothings.api/pull/94
+        - Implemented hub's Auto_Archive feature using AUTO_ARCHIVE_CONFIG https://github.com/biothings/biothings.api/issues/261
+        - Improved data inspection rules for validating field names and values https://github.com/newgene/biothings.api/pull/87
+        - Added a new re_index helper function https://github.com/biothings/biothings.api/issues/269
+        - Added a new helper function to generate local SSL certificate (e.g. to run dev on https) https://github.com/newgene/biothings.api/pull/84
+        - Allow Uploader.load_data method to be called with either data-folder or data-file path https://github.com/newgene/biothings.api/pull/81
+        - Support manifest-only date plugin (with a pre-defined parser) https://github.com/biothings/biothings.api/issues/259
+        - Support biothing_type and display_name in data plugin's manifest file https://github.com/biothings/biothings.api/issues/254
+        - Fixed cursor timeout issue in utils.mongo's doc_feeder helper function https://github.com/biothings/biothings.api/issues/282
+        - Fixed hub logging file names and returned sorting order https://github.com/newgene/biothings.api/pull/88
+        - Fixed CVE-2007-4559 when using tarfile module https://github.com/newgene/biothings.api/pull/74
+        - Fixed Autobuild is not correctly triggered when last build failed https://github.com/biothings/biothings.api/issues/271
+        - Replaced yapf with black as code formatter when exporting data plugins https://github.com/biothings/biothings.api/commit/fce0864b70802326d52ccc2dc71fb6fa1e4c1292
+
+    Experimental features
+        - Automatically clean up Elasticsearch snapshots via AUTO_SNAPSHOT_CLEANUP_CONFIG https://github.com/biothings/biothings.api/issues/276
+        - Allow to delete an existing snapshot https://github.com/newgene/biothings.api/pull/103
+
+    Misc improvements
+        - Added a new biothings.utils.common.DummyConfig class to create a temp config module https://github.com/newgene/biothings.api/pull/79
+        - Fixed all code-styling issue using fourmat (flake8 + black + isort)
+        - Print out the current test url and biothings version in BiothingsWebTest https://github.com/biothings/biothings.api/issues/273
+        - Added API documentation for biothings.hub module https://github.com/biothings/biothings.api/issues/265
+        - The hub commands documentation is now sorted by command names https://github.com/newgene/biothings.api/pull/76
+
+
+v0.11.1 (2022/10/03)
+    Hub improvements:
+        - use pickle protocol 4 as the pickle.dump default
+    Hub bug fixes:
+        - Fixed a JSON serialization error during incremental release https://github.com/newgene/biothings.api/pull/65
+        - Resolved a hub error when installing a full release https://github.com/biothings/biothings.api/issues/257
+        - Fixed a quick_index error when a data source has multiple uploaders https://github.com/newgene/biothings.api/pull/66
+v0.11.0 (2022/09/14)
+    biothings.web improvements
+        - Added Authentication Mixin class for BioThings SDK Web
+        - Added GitHub and ORCID Mixin class for BioThings SDK Web
+        - Allow customize cache settings https://github.com/biothings/biothings.api/issues/206
+        - Support exclude for "fields" parameter https://github.com/biothings/biothings.api/issues/195
+        - Support post_filter query parameter https://github.com/biothings/biothings.api/issues/208
+        - Added "max_total" parameter to POST query https://github.com/biothings/biothings.api/issues/233
+        - Support "analyzer" parameter to POST query
+        - Upgrade to use sentry-sdk https://github.com/biothings/biothings.api/issues/204
+
+    Support Elasticsearch both 7 and 8
+    Support Python 3.9 and 3.10 and dropped Python 3.5 support
+        - Replaced use of yield in coroutine with preferred async/await
+        - Using ProcessPoolExecutor in set_default_executor https://github.com/biothings/biothings.api/issues/153
+        - Upgrade aiocron to 1.6 https://github.com/biothings/biothings.api/issues/180
+        - Upgrade to pymongo v4 https://github.com/biothings/biothings.api/issues/222
+        - Fixed an error when using python 3.9, 3.10: thread.isAlive was replaced by thread.is_alive: https://bugs.python.org/issue37804
+    Hub log improvements
+        - Grouped log files by builds https://github.com/newgene/biothings.api/pull/8
+        - Switch to use TimedRotatingFileHandler for hub log files https://github.com/biothings/biothings.api/issues/211
+        - Remove redundant and unused hub log file https://github.com/biothings/biothings.api/issues/210
+    Data plugin improvements
+        - Support multiple uploaders in data plugin https://github.com/biothings/biothings_docker/issues/8
+        - Allow YAML-based manifest file (manifest.yaml) in a data plugin https://github.com/biothings/biothings.api/issues/245
+    Hub improvements
+        - Implement full release installation without downtime https://github.com/biothings/biothings.api/issues/134
+        - Add dumper and uploader timestamps in source metadata https://github.com/biothings/biothings.api/issues/230
+        - Hub console improvements https://github.com/biothings/biothings.api/issues/216
+        - Create hub's default settings https://github.com/biothings/biothings.api/issues/217
+        - Refactor _parse_comments method logic https://github.com/biothings/biothings.api/issues/218
+        - indexer should check _id length, skip if too long and raise a warning https://github.com/biothings/biothings.api/issues/253
+        - Removed Nginx weak etag prefix and quotes 'W/"<etag>"` when used as src version https://github.com/biothings/biothings.api/pull/234
+
+    get_python_version in utils.version does not return the correct package list https://github.com/biothings/biothings.api/issues/224
+    Fixed "UserWarning: MongoClient opened before fork" in hub logs https://github.com/biothings/biothings.api/issues/247
+
+v0.10.1 (not publically released)
     Fixed multiple issues involving Elasticsearch 7 support on BioThings SDK Hub.
     Fixed a few timezone display issues in BioThings SDK Hub.
     Correctly handles the situation when POST requests resulted in too many matches.
     BioThings SDK Hub Builders only wait on Uploaders of dependency sources
     Updated documentation and other minor fixes.
 
-v0.10.0
+v0.10.0 (2021/09/26)
     Separate "connections", "services", "applications" and "launcher" layers.
     Support MongoDB, SQLAlchemy-compatible SQLs and AWS OpenSearch query backend.
     Support Flask, and FastAPI web framework and WSGI and ASGI gateway interfaces.
     Generalize analytics reporting from traditional GA-Universal Analytics support.
 
-v0.9.1
+v0.9.1 (2021/03/10)
     Revise str -> list parsing for backward compatibility.
 
-v0.9.0
+v0.9.0 (2021/02/21)
     Add features to request argument parsing module.
     Support YAML content-type parsing in request body.
     Support batch query concurrency control.
@@ -56,7 +395,7 @@ v0.7.2 (2020/05/20)
     Add API root path trailing slash redirection.
 
 v0.7.1 (2020/05/19)
-    Improve metadata host info display under dev mode. 
+    Improve metadata host info display under dev mode.
 
 v0.7.0 (2020/05/19)
     Support application/json input.
@@ -70,7 +409,7 @@ v0.6.0 (2020/04/25):
     Add functionalities to create and publish data release (full & incremental)
 
 v0.5.0 (2019/12/02):
-    Support adding license url from datasource metadata. 
+    Support adding license url from datasource metadata.
     Improve concurrent performance with async elasticsearch transport client.
 
 v0.4.0 (2019/08/07):

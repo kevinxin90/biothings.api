@@ -2,8 +2,11 @@
 This module contains util functions may be shared by both BioThings data-hub and web components.
 In general, do not include utils depending on any third-party modules.
 """
+
 import asyncio
 import base64
+import concurrent.futures
+import fnmatch
 import glob
 import gzip
 import hashlib
@@ -16,16 +19,29 @@ import os
 import os.path
 import pickle
 import random
+import shutil
 import string
 import sys
+import tarfile
+import tempfile
 import time
 import types
+import urllib.parse
+import warnings
 from collections import UserDict, UserList
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import date, datetime, timezone
 from functools import partial
 from itertools import islice
 from shlex import shlex
+
+import requests
+import yaml
+
+try:
+    import zstandard as zstd
+except ImportError:
+    zstd = None
 
 # from json serial, catching special type
 # import _sre     # TODO: unused import;remove it once confirmed
@@ -34,31 +50,31 @@ from shlex import shlex
 # ===============================================================================
 # Misc. Utility functions
 # ===============================================================================
-def ask(prompt, options='YN'):
-    '''Prompt Yes or No,return the upper case 'Y' or 'N'.'''
+def ask(prompt, options="YN"):
+    """Prompt Yes or No,return the upper case 'Y' or 'N'."""
     options = options.upper()
     while 1:
-        s = input(prompt+'[%s]' % '|'.join(list(options))).strip().upper()
+        s = input(prompt + "[%s]" % "|".join(list(options))).strip().upper()
         if s in options:
             break
     return s
 
 
 def timesofar(t0, clock=0, t1=None):
-    '''return the string(eg.'3m3.42s') for the passed real time/CPU time so far
-       from given t0 (return from t0=time.time() for real time/
-       t0=time.clock() for CPU time).'''
+    """return the string(eg.'3m3.42s') for the passed real time/CPU time so far
+    from given t0 (return from t0=time.time() for real time/
+    t0=time.clock() for CPU time)."""
     t1 = t1 or time.clock() if clock else time.time()
     t = t1 - t0
     h = int(t / 3600)
     m = int((t % 3600) / 60)
     s = round((t % 3600) % 60, 2)
-    t_str = ''
+    t_str = ""
     if h != 0:
-        t_str += '%sh' % h
+        t_str += "%sh" % h
     if m != 0:
-        t_str += '%sm' % m
-    t_str += '%ss' % s
+        t_str += "%sm" % m
+    t_str += "%ss" % s
     return t_str
 
 
@@ -73,32 +89,32 @@ def is_int(s):
 
 def is_str(s):
     """return True or False if input is a string or not.
-        python3 compatible.
+    python3 compatible.
     """
     return isinstance(s, str)
 
 
 def is_seq(li):
-    """return True if input is either a list or a tuple.
-    """
+    """return True if input is either a list or a tuple."""
     return isinstance(li, (list, tuple))
 
 
 def is_float(f):
-    """return True if input is a float.
-    """
+    """return True if input is a float."""
     return isinstance(f, float)
+
 
 def is_scalar(f):
     # return type(f) in (int, str, bool, float, bytes) or f is None or is_int(f) or is_float(f) or is_str(f)
     return isinstance(f, (int, str, bool, float, bytes)) or f is None
 
+
 def iter_n(iterable, n, with_cnt=False):
-    '''
+    """
     Iterate an iterator by chunks (of n)
     if with_cnt is True, return (chunk, cnt) each time
     ref http://stackoverflow.com/questions/8991506/iterate-an-iterator-by-chunks-of-n-in-python
-    '''
+    """
     it = iter(iterable)
     if with_cnt:
         cnt = 0
@@ -114,75 +130,150 @@ def iter_n(iterable, n, with_cnt=False):
 
 
 def addsuffix(filename, suffix, noext=False):
-    '''Add suffix in front of ".extension", so keeping the same extension.
-       if noext is True, remove extension from the filename.'''
+    """Add suffix in front of ".extension", so keeping the same extension.
+    if noext is True, remove extension from the filename."""
     if noext:
         return os.path.splitext(filename)[0] + suffix
     else:
         return suffix.join(os.path.splitext(filename))
 
 
-def safewfile(filename, prompt=True, default='C', mode='w'):
-    '''return a file handle in 'w' mode,use alternative name if same name exist.
-       if prompt == 1, ask for overwriting,appending or changing name,
-       else, changing to available name automatically.'''
+def safewfile(filename, prompt=True, default="C", mode="w"):
+    """return a file handle in 'w' mode,use alternative name if same name exist.
+    if prompt == 1, ask for overwriting,appending or changing name,
+    else, changing to available name automatically."""
     suffix = 1
     while 1:
         if not os.path.exists(filename):
             break
-        print('Warning:"%s" exists.' % filename, end='')
+        print('Warning:"%s" exists.' % filename, end="")
         if prompt:
-            option = ask('Overwrite,Append or Change name?', 'OAC')
+            option = ask("Overwrite,Append or Change name?", "OAC")
         else:
             option = default
-        if option == 'O':
-            if not prompt or ask('You sure?') == 'Y':
+        if option == "O":
+            if not prompt or ask("You sure?") == "Y":
                 print("Overwritten.")
                 break
-        elif option == 'A':
+        elif option == "A":
             print("Append to original file.")
-            f = open(filename, 'a')
-            f.write('\n' + "=" * 20 + 'Appending on ' + time.ctime() + "=" * 20 + '\n')
+            f = open(filename, "a")
+            f.write("\n" + "=" * 20 + "Appending on " + time.ctime() + "=" * 20 + "\n")
             return f, filename
-        print('Use "%s" instead.' % addsuffix(filename, '_' + str(suffix)))
-        filename = addsuffix(filename, '_' + str(suffix))
+        print('Use "%s" instead.' % addsuffix(filename, "_" + str(suffix)))
+        filename = addsuffix(filename, "_" + str(suffix))
         suffix += 1
     return open(filename, mode), filename
 
 
-def anyfile(infile, mode='r'):
-    '''
-    return a file handler with the support for gzip/zip comppressed files.
+def _closing_parent(wrapper, parent):
+    """Make closing ``wrapper`` also close ``parent``.
+
+    Used for archive members (tarfile/zipfile) whose extracted stream doesn't own the
+    archive's underlying file descriptor - closing just the stream leaves the archive
+    handle open (and leaking) until garbage collected.
+    """
+    close = wrapper.close
+
+    def close_and_close_parent():
+        try:
+            close()
+        finally:
+            parent.close()
+
+    wrapper.close = close_and_close_parent
+    return wrapper
+
+
+def anyfile(infile, mode="r"):
+    """
+    return a file handler with the support for gzip/zip compressed files.
     if infile is a two value tuple, then first one is the compressed file;
     the second one is the actual filename in the compressed file.
     e.g., ('a.zip', 'aa.txt')
 
-    '''
+    """
     if isinstance(infile, tuple):
         infile, rawfile = infile[:2]
     else:
         rawfile = os.path.splitext(infile)[0]
     filetype = os.path.splitext(infile)[1].lower()
-    if filetype == '.gz':
+
+    # check if lower version zst handling is needed
+    lower_version_zst = False
+    if sys.version_info < (3, 14) and filetype == ".zst":
+        if zstd is None:
+            raise ImportError("zstandard is required to open .zst files on Python versions below 3.14")
+        lower_version_zst = True
+
+    # tarfile handling. works for zst in Python >= 3.14
+    if lower_version_zst or tarfile.is_tarfile(infile):
+        if lower_version_zst:
+            with open(infile, "rb") as compressed_file:
+                dctx = zstd.ZstdDecompressor()
+                with closing(dctx.stream_reader(compressed_file)) as reader:
+                    with tarfile.open(fileobj=reader, mode="r|") as tar_file:
+                        for member in tar_file:
+                            if member.name == rawfile:
+                                extracted = tar_file.extractfile(member)
+                                break
+                        else:
+                            extracted = None
+
+                        # Keep the returned file readable after closing the tar and zst streams.
+                        if extracted is not None:
+                            with extracted:
+                                spooled_file = tempfile.SpooledTemporaryFile(  # pylint: disable=consider-using-with
+                                    max_size=1024 * 1024
+                                )
+                                shutil.copyfileobj(extracted, spooled_file)
+                            spooled_file.seek(0)
+
+            # extracted member is not a regular file or link
+            if extracted is None:
+                raise ValueError("invalid target file: must be a regular file or a link")
+
+            return spooled_file
+
+        tar_file = tarfile.open(infile, mode)  # pylint: disable=consider-using-with
+        try:
+            extracted = tar_file.extractfile(rawfile)
+        except KeyError as exc:
+            # provided rawfile does not appear in the tarball
+            tar_file.close()
+            raise FileNotFoundError("target member does not contain the provided tar file.") from exc
+
+        # extracted member is not a regular file or link
+        if extracted is None:
+            tar_file.close()
+            raise ValueError("invalid target file: must be a regular file or a link")
+
+        return _closing_parent(io.TextIOWrapper(extracted), tar_file)
+
+    if filetype == ".gz":
         # import gzip
         in_f = io.TextIOWrapper(gzip.GzipFile(infile, mode))
-    elif filetype == '.zip':
+    elif filetype == ".zip":
         import zipfile
-        in_f = io.TextIOWrapper(zipfile.ZipFile(infile, mode).open(rawfile, mode))
-    elif filetype == '.xz':
+
+        zip_file = zipfile.ZipFile(infile, mode)  # pylint: disable=consider-using-with
+        in_f = _closing_parent(io.TextIOWrapper(zip_file.open(rawfile, mode)), zip_file)
+    elif filetype == ".xz":
         import lzma
+
         in_f = io.TextIOWrapper(lzma.LZMAFile(infile, mode))
     else:
         in_f = open(infile, mode)
     return in_f
 
+
 def is_filehandle(fh):
-    '''return True/False if fh is a file-like object'''
-    return hasattr(fh, 'read') and hasattr(fh, 'close')
+    """return True/False if fh is a file-like object"""
+    return hasattr(fh, "read") and hasattr(fh, "close")
 
 
-##  This is another (older) implementation of open_anyfile
-##   Keep the code here for reference
+# #  This is another (older) implementation of open_anyfile
+# #   Keep the code here for reference
 #
 # class open_anyfile(object):
 #     '''a context manager can be used in "with" stmt.
@@ -207,13 +298,13 @@ def is_filehandle(fh):
 
 
 @contextmanager
-def open_anyfile(infile, mode='r'):
-    '''a context manager can be used in "with" stmt.
-       accepts a filehandle or anything accepted by anyfile function.
+def open_anyfile(infile, mode="r"):
+    """a context manager can be used in "with" stmt.
+    accepts a filehandle or anything accepted by anyfile function.
 
-        with open_anyfile('test.txt') as in_f:
-            do_something()
-    '''
+     with open_anyfile('test.txt') as in_f:
+         do_something()
+    """
     if is_filehandle(infile):
         in_f = infile
     else:
@@ -233,8 +324,10 @@ class dotdict(dict):
             return value
         else:
             return value
+
     __setattr__ = dict.__setitem__
     __delattr__ = dict.__delitem__
+
 
 def get_dotfield_value(dotfield, d):
     """
@@ -251,8 +344,56 @@ def get_dotfield_value(dotfield, d):
         first = fields[0]
         return get_dotfield_value(".".join(fields[1:]), d[first])
 
+
+def find_value_in_doc(dotfield, value, doc):
+    """
+    Explore mixed dictionary using dotfield notation and return value.
+    Stringify before search
+    Support wildcard searching
+    The comparison is case-sensitive
+    Example::
+
+    X = {"a":{"b": "1"},"x":[{"y": "3", "z": "4"}, "5"]}
+    Y = ["a", {"b": "1"}, {"x":[{"y": "3", "z": "4"}, "5"]}]
+    Z = ["a", {"b": "1"}, {"x":[{"y": "34567", "z": "4"}, "5"]}]
+    assert find_value_in_doc("a.b", "1", X)
+    assert find_value_in_doc("x.y", "3", X)
+    assert find_value_in_doc("x.y", "3*7", Z)
+    assert find_value_in_doc("x.y", "34567", Z)
+    assert find_value_in_doc("x", "5", Y)
+    assert find_value_in_doc("a.b", "c", X) is False
+    assert find_value_in_doc("a", "c", X) is False
+    """
+
+    if dotfield == "":
+        fields = []
+    else:
+        fields = dotfield.split(".")
+
+    if isinstance(doc, list):
+        try:
+            for item in doc:
+                found = find_value_in_doc(dotfield, value, item)
+                if found:
+                    return found
+            return False
+        except Exception:
+            return False
+    elif isinstance(doc, dict):
+        if not fields:
+            return False
+        return find_value_in_doc(".".join(fields[1:]), value, doc.get(fields[0]))
+    else:
+        # doc is a scalar value, we will stringify it and then compare with value
+        if fields:
+            return False
+        if doc is None and value is not None:
+            return False
+        return fnmatch.fnmatchcase(str(doc), value)
+
+
 def split_ids(q):
-    '''
+    """
     split input query string into list of ids.
     any of ``" \t\n\x0b\x0c\r|,+"`` as the separator,
     but perserving a phrase if quoted
@@ -266,83 +407,87 @@ def split_ids(q):
          ['CDK2', 'CDK3']
         >>> split_ids('"CDK2 CDK3"\n CDk4')
          ['CDK2 CDK3', 'CDK4']
-    '''
+    """
     # Python3 strings are already unicode, .encode
     # now returns a bytearray, which cannot be searched with
     # shlex.  For now, do this terrible thing until we discuss
     if sys.version_info.major == 3:
         lex = shlex(q, posix=True)
     else:
-        lex = shlex(q.encode('utf8'), posix=True)
-    lex.whitespace = ' \t\n\x0b\x0c\r|,+'
+        lex = shlex(q.encode("utf8"), posix=True)
+    lex.whitespace = " \t\n\x0b\x0c\r|,+"
     lex.whitespace_split = True
-    lex.commenters = ''
+    lex.commenters = ""
     if sys.version_info.major == 3:
         ids = [x.strip() for x in list(lex)]
     else:
-        ids = [x.decode('utf8').strip() for x in list(lex)]
+        ids = [x.decode("utf8").strip() for x in list(lex)]
     ids = [x for x in ids if x]
     return ids
 
 
-def get_compressed_outfile(filename, compress='gzip'):
-    '''Get a output file handler with given compress method.
-       currently support gzip/bz2/lzma, lzma only available in py3
-    '''
+def get_compressed_outfile(filename, compress="gzip"):
+    """Get a output file handler with given compress method.
+    currently support gzip/bz2/lzma, lzma only available in py3
+    """
     if compress == "gzip":
         # import gzip
-        out_f = gzip.GzipFile(filename, 'wb')
-    elif compress == 'bz2':
+        out_f = gzip.GzipFile(filename, "wb")
+    elif compress == "bz2":
         import bz2
-        out_f = bz2.BZ2File(filename, 'wb')
-    elif compress == 'lzma' or compress == 'xz':
+
+        out_f = bz2.BZ2File(filename, "wb")
+    elif compress == "lzma" or compress == "xz":
         import lzma
-        out_f = lzma.LZMAFile(filename, 'wb')
+
+        out_f = lzma.LZMAFile(filename, "wb")
     elif compress is None:
-        out_f = open(filename, 'wb')
+        out_f = open(filename, "wb")
     else:
         raise ValueError("Invalid compress parameter.")
     return out_f
 
 
 def open_compressed_file(filename):
-    '''Get a read-only file-handler for compressed file,
-       currently support gzip/bz2/lzma, lzma only available in py3
-    '''
-    in_f = open(filename, 'rb')
+    """Get a read-only file-handler for compressed file,
+    currently support gzip/bz2/lzma, lzma only available in py3
+    """
+    in_f = open(filename, "rb")
     sig = in_f.read(5)
     in_f.close()
-    if sig[:3] == b'\x1f\x8b\x08':
+    if sig[:3] == b"\x1f\x8b\x08":
         # this is a gzip file
         # import gzip
-        fobj = gzip.GzipFile(filename, 'rb')
-    elif sig[:3] == b'BZh':
+        fobj = gzip.GzipFile(filename, "rb")
+    elif sig[:3] == b"BZh":
         # this is a bz2 file
         import bz2
-        fobj = bz2.BZ2File(filename, 'r')
-    elif sig[:5] == b'\xfd7zXZ':
+
+        fobj = bz2.BZ2File(filename, "r")
+    elif sig[:5] == b"\xfd7zXZ":
         # this is a lzma file
         import lzma
-        fobj = lzma.LZMAFile(filename, 'r')
+
+        fobj = lzma.LZMAFile(filename, "r")
     else:
         # assuming uncompressed ?
-        fobj = open(filename, 'rb')
+        fobj = open(filename, "rb")
     return fobj
 
 
-def dump(obj, filename, protocol=2, compress='gzip'):
-    '''Saves a compressed object to disk
-       binary protocol 2 is compatible with py2, 3 and 4 are for py3
-    '''
-    # TODO: in py3, protocol=3 is the default, and also support protocol=4
-    #       for py>=3.4. We should check which one works best for us.
+def dump(obj, filename, protocol=4, compress="gzip"):
+    """Saves a compressed object to disk
+    protocol version 4 is the default for py3.8, supported since py3.4
+    """
+    # NOTE: py3.8 added protocol=5 support, 4 is still the default,
+    #       We can check later to set 5 as the default when it's time.
     out_f = get_compressed_outfile(filename, compress=compress)
     pickle.dump(obj, out_f, protocol=protocol)
     out_f.close()
 
 
 def dump2gridfs(obj, filename, db, protocol=2):
-    '''Save a compressed (support gzip only) object to MongoDB gridfs.'''
+    """Save a compressed (support gzip only) object to MongoDB gridfs."""
     import gridfs
 
     # import gzip
@@ -351,33 +496,34 @@ def dump2gridfs(obj, filename, db, protocol=2):
         fs.delete(filename)
     fobj = fs.new_file(filename=filename, _id=filename)
     try:
-        gzfobj = gzip.GzipFile(filename=filename, mode='wb', fileobj=fobj)
+        gzfobj = gzip.GzipFile(filename=filename, mode="wb", fileobj=fobj)
         pickle.dump(obj, gzfobj, protocol=protocol)
     finally:
         gzfobj.close()
         fobj.close()
 
 
-def loadobj(filename, mode='file'):
-    '''
+def loadobj(filename, mode="file"):
+    """
     Loads a compressed object from disk file (or file-like handler) or
     MongoDB gridfs file (mode='gridfs')
     ::
 
         obj = loadobj('data.pyobj')
         obj = loadobj(('data.pyobj', mongo_db), mode='gridfs')
-    '''
+    """
     # import gzip
-    if mode == 'gridfs':
+    if mode == "gridfs":
         import gridfs
-        filename, db = filename   # input is a tuple of (filename, mongo_db)
+
+        filename, db = filename  # input is a tuple of (filename, mongo_db)
         fs = gridfs.GridFS(db)
         fobj = gzip.GzipFile(fileobj=fs.get(filename))
     else:
         if is_str(filename):
             fobj = open_compressed_file(filename)
         else:
-            fobj = filename   # input is a file-like handler
+            fobj = filename  # input is a file-like handler
     try:
         obj = pickle.load(fobj)
     finally:
@@ -386,7 +532,7 @@ def loadobj(filename, mode='file'):
 
 
 def list2dict(a_list, keyitem, alwayslist=False):
-    '''
+    """
     Return a dictionary with specified keyitem as key, others as values.
     keyitem can be an index or a sequence of indexes.
     For example::
@@ -402,29 +548,40 @@ def list2dict(a_list, keyitem, alwayslist=False):
 
         list2dict(li, 0, True)---> {'A':[('a',1),('b',3)],
                                     'B':[('a',2),]}
-    '''
+    """
     _dict = {}
     for x in a_list:
-        if isinstance(keyitem, int):      # single item as key
+        if isinstance(keyitem, int):  # single item as key
             key = x[keyitem]
-            value = tuple(x[:keyitem] + x[keyitem + 1:])
+            value = tuple(x[:keyitem] + x[keyitem + 1 :])
         else:
             key = tuple([x[i] for i in keyitem])
             value = tuple([x[i] for i in range(len(a_list)) if i not in keyitem])
-        if len(value) == 1:      # single value
+        if len(value) == 1:  # single value
             value = value[0]
         if key not in _dict:
             if alwayslist:
-                _dict[key] = [value, ]
+                _dict[key] = [
+                    value,
+                ]
             else:
                 _dict[key] = value
         else:
             current_value = _dict[key]
             if not isinstance(current_value, list):
-                current_value = [current_value, ]
+                current_value = [
+                    current_value,
+                ]
             current_value.append(value)
             _dict[key] = current_value
     return _dict
+
+
+def list_trim(a_list, idx_to_remove):
+    """Remove items IN-PLACE from a list by index."""
+    for i in sorted(idx_to_remove, reverse=True):
+        del a_list[i]
+
 
 def filter_dict(d, keys):
     """
@@ -447,23 +604,26 @@ def filter_dict(d, keys):
             d.pop(key, None)
     return d
 
+
 def get_random_string():
     strb = base64.b64encode(os.urandom(6), "".join(random.sample(string.ascii_letters, 2)).encode("ascii"))
     return strb.decode("ascii")
 
+
 def get_timestamp():
-    return time.strftime('%Y%m%d')
+    return time.strftime("%Y%m%d")
+
 
 class LogPrint:
     def __init__(self, log_f, log=1, timestamp=0):
-        '''If this class is set to sys.stdout, it will output both log_f and __stdout__.
-           log_f is a file handler.
-        '''
+        """If this class is set to sys.stdout, it will output both log_f and __stdout__.
+        log_f is a file handler.
+        """
         self.log_f = log_f
         self.log = log
         self.timestamp = timestamp
         if self.timestamp:
-            self.log_f.write('*'*10 + 'Log starts at ' + time.ctime() + '*'*10 + '\n')
+            self.log_f.write("*" * 10 + "Log starts at " + time.ctime() + "*" * 10 + "\n")
 
     def write(self, text):
         sys.__stdout__.write(text)
@@ -485,20 +645,22 @@ class LogPrint:
 
     def close(self):
         if self.timestamp:
-            self.log_f.write('*'*10 + 'Log ends at ' + time.ctime() + '*'*10 + '\n')
+            self.log_f.write("*" * 10 + "Log ends at " + time.ctime() + "*" * 10 + "\n")
         sys.stdout = sys.__stdout__
         self.log_f.close()
 
     def fileno(self):
         return self.log_f.fileno()
 
+
 def setup_logfile(logfile):
     fh = logging.FileHandler(logfile)
-    fh.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    fh.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
     logging.getLogger().addHandler(fh)
 
+
 def find_doc(k, keys):
-    ''' Used by jsonld insertion in www.api.es._insert_jsonld '''
+    """Used by jsonld insertion in www.api.es._insert_jsonld"""
     n = len(keys)
     for i in range(n):
         # if k is a dictionary, then directly get its value
@@ -519,35 +681,37 @@ def find_doc(k, keys):
             k = tmp
     return k
 
-def SubStr(input_string, start_string='', end_string='', include=0):
-    '''Return the substring between start_string and end_string.
-        If start_string is '', cut string from the beginning of input_string.
-        If end_string is '', cut string to the end of input_string.
-        If either start_string or end_string can not be found from input_string, return ''.
-        The end_pos is the first position of end_string after start_string.
-        If multi-occurence,cut at the first position.
-        include=0(default), does not include start/end_string;
-        include=1:          include start/end_string.'''
+
+def SubStr(input_string, start_string="", end_string="", include=0):
+    """Return the substring between start_string and end_string.
+    If start_string is '', cut string from the beginning of input_string.
+    If end_string is '', cut string to the end of input_string.
+    If either start_string or end_string can not be found from input_string, return ''.
+    The end_pos is the first position of end_string after start_string.
+    If multi-occurence,cut at the first position.
+    include=0(default), does not include start/end_string;
+    include=1:          include start/end_string."""
 
     start_pos = input_string.find(start_string)
     if start_pos == -1:
-        return ''
+        return ""
     start_pos += len(start_string)
-    if end_string == '':
+    if end_string == "":
         end_pos = len(input_string)
     else:
-        end_pos = input_string[start_pos:].find(end_string)   # get the end_pos relative with the start_pos
+        end_pos = input_string[start_pos:].find(end_string)  # get the end_pos relative with the start_pos
         if end_pos == -1:
-            return ''
+            return ""
         else:
             end_pos += start_pos  # get actual end_pos
     if include == 1:
-        return input_string[start_pos - len(start_string): end_pos + len(end_string)]
+        return input_string[start_pos - len(start_string) : end_pos + len(end_string)]
     else:
         return input_string[start_pos:end_pos]
 
-def safe_unicode(s, mask='#'):
-    '''replace non-decodable char into "#".'''
+
+def safe_unicode(s, mask="#"):
+    """replace non-decodable char into "#"."""
     try:
         _s = str(s)
     except UnicodeDecodeError as e:
@@ -558,21 +722,23 @@ def safe_unicode(s, mask='#'):
 
     return _s
 
+
 def file_newer(source, target):
-    '''return True if source file is newer than target file.'''
+    """return True if source file is newer than target file."""
     return os.stat(source)[-2] > os.stat(target)[-2]
 
-def newer(t0, t1, fmt='%Y%m%d'):
-    '''t0 and t1 are string of timestamps matching "format" pattern.
-       Return True if t1 is newer than t0.
-    '''
+
+def newer(t0, t1, fmt="%Y%m%d"):
+    """t0 and t1 are string of timestamps matching "format" pattern.
+    Return True if t1 is newer than t0.
+    """
     return datetime.strptime(t0, fmt) < datetime.strptime(t1, fmt)
 
 
 class BiothingsJSONEncoder(json.JSONEncoder):
-    '''A class to dump Python Datetime object.
-        json.dumps(data, cls=DateTimeJSONEncoder, indent=indent)
-    '''
+    """A class to dump Python Datetime object.
+    json.dumps(data, cls=DateTimeJSONEncoder, indent=indent)
+    """
 
     def default(self, o):
         if isinstance(o, (datetime, date)):
@@ -610,7 +776,7 @@ def json_encode(obj):
 
 
 def rmdashfr(top):
-    '''Recursively delete dirs and files from "top" directory, then delete "top" dir'''
+    """Recursively delete dirs and files from "top" directory, then delete "top" dir"""
     assert top  # prevent rm -fr * ... (let's be explicit there)
     for root, dirs, files in os.walk(top, topdown=False):
         for name in files:
@@ -623,10 +789,12 @@ def rmdashfr(top):
         # top did not exist, silently ignore
         pass
 
+
 def get_class_from_classpath(class_path):
     str_mod, str_klass = ".".join(class_path.split(".")[:-1]), class_path.split(".")[-1]
     mod = importlib.import_module(str_mod)
     return getattr(mod, str_klass)
+
 
 def find_classes_subclassing(mods, baseclass):
     """
@@ -647,43 +815,75 @@ def find_classes_subclassing(mods, baseclass):
                 classes.append(klass)
     return classes
 
-def sizeof_fmt(num, suffix='B'):
+
+def sanitize_tarfile(tar_object, directory):
+    """
+    Prevent user-assisted remote attackers to overwrite arbitrary files via a .. (dot dot) sequence
+    in filenames in a TAR archive, a related issue to CVE-2007-4559
+    """
+    for member in tar_object.getmembers():
+        target = os.path.join(directory, member.name)
+        abs_directory = os.path.abspath(directory)
+        abs_target = os.path.abspath(target)
+        prefix = os.path.commonprefix([abs_directory, abs_target])
+        if not prefix == abs_directory:
+            raise ValueError("Attempted Path Traversal in Tar File")
+
+
+def sizeof_fmt(num, suffix="B"):
     # http://stackoverflow.com/questions/1094841/reusable-library-to-get-human-readable-version-of-file-size
-    for unit in ['', 'Ki', 'Mi', 'Gi', 'Ti', 'Pi', 'Ei', 'Zi']:
+    for unit in ["", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"]:
         if abs(num) < 1024.0:
             return "%3.1f%s%s" % (num, unit, suffix)
         num /= 1024.0
-    return "%.1f%s%s" % (num, 'Yi', suffix)
+    return "%.1f%s%s" % (num, "Yi", suffix)
 
 
 def unzipall(folder, pattern="*.zip"):
-    '''
+    """
     unzip all zip files in "folder", in "folder"
-    '''
+    """
     import zipfile
+
     for zfile in glob.glob(os.path.join(folder, pattern)):
-        zf = zipfile.ZipFile(zfile)
-        logging.info("unzipping '%s'", zf.filename)
-        zf.extractall(folder)
-        logging.info("done unzipping '%s'", zf.filename)
+        with zipfile.ZipFile(zfile) as zf:
+            logging.info("unzipping '%s'", zf.filename)
+            zf.extractall(folder)
+            logging.info("done unzipping '%s'", zf.filename)
+
 
 def untargzall(folder, pattern="*.tar.gz"):
-    '''
+    """
     gunzip and untar all ``*.tar.gz`` files in "folder"
-    '''
+    """
     import tarfile
+
     for tgz in glob.glob(os.path.join(folder, pattern)):
-        gz = gzip.GzipFile(tgz)
-        tf = tarfile.TarFile(fileobj=gz)
-        logging.info("untargz '%s'", tf.name)
-        tf.extractall(folder)
-        logging.info("done untargz '%s'", tf.name)
+        with gzip.GzipFile(tgz) as gz, tarfile.TarFile(fileobj=gz) as tf:
+            sanitize_tarfile(tf, folder)
+            logging.info("untargz '%s'", tf.name)
+            tf.extractall(folder)
+            logging.info("done untargz '%s'", tf.name)
+
+
+def untarall(folder, pattern="*.tar"):
+    """
+    untar all ``*.tar`` files in "folder"
+    """
+    import tarfile
+
+    for tg in glob.glob(os.path.join(folder, pattern)):
+        with tarfile.TarFile(tg) as tf:
+            sanitize_tarfile(tf, folder)
+            logging.info("untargz '%s'", tf.name)
+            tf.extractall(folder)
+            logging.info("done untar '%s'", tf.name)
 
 
 def gunzipall(folder, pattern="*.gz"):
-    '''
+    """
     gunzip all ``*.gz`` files in "folder"
-    '''
+    """
     for f in glob.glob(os.path.join(folder, pattern)):
         # build uncompress filename from gz file and pattern
         # pattern is used to select/filter files, but it may not
@@ -692,15 +892,18 @@ def gunzipall(folder, pattern="*.gz"):
         suffix = ".%s" % pattern.split(".")[1]
         gunzip(f, suffix)
 
+
 def unxzall(folder, pattern="*.xz"):
-    '''
+    """
     unxz all xz files in "folder", in "folder"
-    '''
+    """
     import tarfile
+
     for xzfile in glob.glob(os.path.join(folder, pattern)):
         logging.info("unxzing '%s'", xzfile)
-        with tarfile.open(xzfile, 'r:xz') as t:
-            t.extractall(folder)
+        with tarfile.open(xzfile, "r:xz") as tf:
+            sanitize_tarfile(tf, folder)
+            tf.extractall(folder)
         logging.info("done unxzing '%s'", xzfile)
 
 
@@ -715,37 +918,30 @@ def gunzip(f, pattern="*.gz"):
         logging.info("Done gunzip '%s'", gz.name)
     fout.close()
 
-@asyncio.coroutine
-def aiogunzipall(folder, pattern, job_manager, pinfo):
+
+async def aiogunzipall(folder, pattern, job_manager, pinfo):
     """
     Gunzip all files in folder matching pattern. job_manager is used
     for parallelisation, and pinfo is a pre-filled dict used by
     job_manager to report jobs in the hub (see bt.utils.manager.JobManager)
     """
-    jobs = []
-    got_error = None
-    logging.info("Unzipping files in '%s'", folder)
-    for f in glob.glob(os.path.join(folder, pattern)):
-        pinfo["description"] = os.path.basename(f)
-        suffix = pattern.replace("*", "")
-        job = yield from job_manager.defer_to_process(pinfo, partial(gunzip, f, suffix=suffix))
+    async def gunzip_one(job, infile):
+        try:
+            await job
+        except Exception as e:
+            logging.error("Failed to gunzip file %s: %s", infile, e)
+            raise
 
-        def gunzipped(fut, infile):
-            try:
-                # res = fut.result()
-                fut.result()
-            except Exception as e:
-                logging.error("Failed to gunzip file %s: %s", infile, e)
-                nonlocal got_error
-                got_error = e
-        job.add_done_callback(partial(gunzipped, infile=f))
-        jobs.append(job)
-        if got_error:
-            raise got_error
-    if jobs:
-        yield from asyncio.gather(*jobs)
-        if got_error:
-            raise got_error
+    logging.info("Unzipping files in '%s'", folder)
+    try:
+        async with asyncio.TaskGroup() as tg:
+            for f in glob.glob(os.path.join(folder, pattern)):
+                pinfo["description"] = os.path.basename(f)
+                job = await job_manager.defer_to_process(pinfo, partial(gunzip, f, pattern=pattern))
+                tg.create_task(gunzip_one(job, f))
+    except* Exception as eg:
+        raise first_exception(eg) from eg
+
 
 def uncompressall(folder):
     """Try to uncompress any known archive files in folder"""
@@ -753,6 +949,7 @@ def uncompressall(folder):
     untargzall(folder)
     gunzipall(folder)
     unxzall(folder)
+
 
 def md5sum(fname):
     hash_md5 = hashlib.md5()
@@ -765,11 +962,14 @@ def md5sum(fname):
 class splitstr(str):
     """Type representing strings with space in it"""
 
+
 class nan(object):
     """Represents NaN type, but not as a float"""
 
+
 class inf(object):
     """Represents Inf type, but not as a float"""
+
 
 def traverse(obj, leaf_node=False):
     """
@@ -807,17 +1007,18 @@ def traverse(obj, leaf_node=False):
     if isinstance(obj, (dict, UserDict)):  # path level increases
         for key in obj:
             for sub_path, val in traverse(obj[key], leaf_node):
-                yield '.'.join((str(key), str(sub_path))).strip('.'), val
+                yield ".".join((str(key), str(sub_path))).strip("."), val
         if not leaf_node:
-            yield '', obj
+            yield "", obj
     elif isinstance(obj, list):  # does not affect path
         for item in obj:
             for sub_path, val in traverse(item, leaf_node):
                 yield sub_path, val
         if not leaf_node or not obj:  # [] count as a leaf node
-            yield '', obj
+            yield "", obj
     elif leaf_node:  # including str, int, float, and *None*.
-        yield '', obj
+        yield "", obj
+
 
 def run_once():
     """
@@ -838,7 +1039,6 @@ def run_once():
     has_run = set()
 
     def should_run(identifier=None):
-
         if identifier in has_run:
             return False
 
@@ -846,6 +1046,7 @@ def run_once():
         return True
 
     return should_run
+
 
 def merge(x, dx):
     """
@@ -876,3 +1077,92 @@ def merge(x, dx):
         else:
             x[k] = v
     return x
+
+
+def get_loop():
+    """Return the running event loop if called from within one, otherwise the
+    thread's current loop, creating and registering a new one if needed."""
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    # suppress the "no current event loop" DeprecationWarning locally:
+    # returning the thread's already-set loop (or transparently creating one)
+    # is exactly the behavior we want to keep
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+    return loop
+
+
+def first_exception(exc_group):
+    """Return the first leaf exception of an ExceptionGroup (e.g. raised by
+    asyncio.TaskGroup), for callers needing a single exception, like job
+    status reports storing one error message."""
+    while isinstance(exc_group, BaseExceptionGroup):
+        exc_group = exc_group.exceptions[0]
+    return exc_group
+
+
+def get_loop_with_max_workers(max_workers=None):
+    loop = get_loop()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    loop.set_default_executor(executor)
+    return loop
+
+
+class DummyConfig(types.ModuleType):
+    """This class allows "import config" or "from biothings import config"
+    to work without actually creating a config.py file:
+
+        import sys
+        from biothings.utils.common import DummyConfig
+        sys.modules["config"] = DummyConfig('config')
+        sys.modules["biothings.config"] = DummyConfig('config')
+    """
+
+    pass
+
+
+def get_plugin_name_from_local_manifest(path):
+    default_name = os.path.basename(path)
+    manifest_json_path = os.path.join(path, "manifest.json")
+    manifest_yaml_path = os.path.join(path, "manifest.yaml")
+    if os.path.isfile(manifest_json_path):
+        with open(manifest_json_path, "r") as fp:
+            manifest_json = json.loads(fp.read())
+            return manifest_json.get("name", default_name)
+    elif os.path.isfile(manifest_yaml_path):
+        with open(manifest_yaml_path, "r") as fp:
+            manifest_json = yaml.safe_load(fp)
+            return manifest_json.get("name", default_name)
+    else:
+        return None
+
+
+def get_plugin_name_from_remote_manifest(url):
+    split = urllib.parse.urlsplit(url)
+    name = os.path.basename(split.path).replace(".git", "")
+    org_name = os.path.dirname(split.path).strip("/")
+    manifest_json = {}
+    manifest_json_url = f"https://raw.githubusercontent.com/{org_name}/{name}/master/manifest.json"
+    manifest_yaml_url = f"https://raw.githubusercontent.com/{org_name}/{name}/master/manifest.yaml"
+    try:
+        response = requests.get(url=manifest_json_url)
+        manifest_json = json.loads(response.text)
+    except Exception:
+        response = requests.get(url=manifest_yaml_url)
+        manifest_json = yaml.safe_load(response.text)
+    finally:
+        name = manifest_json.get("name", name)
+    return name
+
+
+def parse_folder_name_from_url(url):
+    split = urllib.parse.urlsplit(url)
+    folder_name = os.path.basename(split.path).replace(".git", "")
+    return folder_name

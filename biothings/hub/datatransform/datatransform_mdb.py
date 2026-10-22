@@ -2,16 +2,15 @@
 DataTransform MDB module - class for performing key lookup
 using conversions described in a networkx graph.
 """
+
 # pylint: disable=E0401, E0611
 import copy
 
-from networkx import all_simple_paths, all_shortest_paths, nx
+import networkx as nx
 from pymongo.collation import Collation
-from biothings.hub.datatransform import DataTransform
-from biothings.hub.datatransform import DataTransformEdge
-from biothings.hub.datatransform import IDStruct
-from biothings.hub.datatransform import nested_lookup
+
 import biothings.utils.mongo as mongo
+from biothings.hub.datatransform import DataTransform, DataTransformEdge, IDStruct, nested_lookup
 from biothings.utils.loggers import get_logger
 
 
@@ -22,6 +21,7 @@ class MongoDBEdge(DataTransformEdge):
     a collection. The output identifier values are read out of that
     collection:
     """
+
     def __init__(self, collection_name, lookup, field, weight=1, label=None, check_index=True):
         # pylint: disable=R0913
         """
@@ -55,16 +55,15 @@ class MongoDBEdge(DataTransformEdge):
                     for k in keys:
                         avail_idxs[k] = True
                 if self.lookup not in avail_idxs:
-                    raise ValueError("Field '%s' isn't indexed, this would " % self.lookup
-                                     + "result in very long datatransform process")
+                    raise ValueError(
+                        "Field '%s' isn't indexed, this would " % self.lookup
+                        + "result in very long datatransform process"
+                    )
             else:
                 self.logger.warning("Collection '%s' doesn't exist, can't check indices" % self.collection_name)
 
     def init_state(self):
-        self._state = {
-            "collection": None,
-            "logger": None
-        }
+        self._state = {"collection": None, "logger": None}
 
     @property
     def collection(self):
@@ -129,6 +128,7 @@ class CIMongoDBEdge(MongoDBEdge):
     """
     Case-insensitive MongoDBEdge
     """
+
     def __init__(self, collection_name, lookup, field, weight=1, label=None):
         # pylint: disable=R0913, W0235
         super(CIMongoDBEdge, self).__init__(collection_name, lookup, field, weight, label)
@@ -138,17 +138,19 @@ class CIMongoDBEdge(MongoDBEdge):
         Abstract out (as one line) the call to collection.find
         and use a case-insensitive collation
         """
-        return self.collection.find({lookup: {"$in": id_lst}}, {lookup: 1, field: 1})\
-            .collation(Collation(locale='en', strength=2))
+        return self.collection.find({lookup: {"$in": id_lst}}, {lookup: 1, field: 1}).collation(
+            Collation(locale="en", strength=2)
+        )
 
 
 class DataTransformMDB(DataTransform):
     """
     Convert document identifiers from one type to another.
     """
+
     # Constants
     batch_size = 1000
-    default_source = '_id'
+    default_source = "_id"
 
     def __init__(self, graph, *args, **kwargs):
         """
@@ -186,15 +188,43 @@ class DataTransformMDB(DataTransform):
                               source document regardless as to weather it matches an
                               edge or not. (advanced usage)
         :type copy_from_doc: bool
+
+        Note: Prefixes can be defined at the node level using:
+              graph.add_node("chebi", prefix="CHEBI")
+              When an identifier is converted to a node with a prefix attribute,
+              the prefix will be automatically added to the _id.
         """
         if not isinstance(graph, nx.DiGraph):
             raise ValueError("key_lookup configuration error:  graph must be of type nx.DiGraph")
         self._validate_graph(graph)
         self.graph = graph
-        self.logger, _ = get_logger('datatransform')
+        self.logger, _ = get_logger("datatransform")
 
         super(DataTransformMDB, self).__init__(*args, **kwargs)
         self._precompute_paths()
+
+    def _apply_prefix(self, identifier, output_type):
+        """
+        Apply prefix to identifier based on output type.
+
+        Prefixes are defined as node attributes in the graph:
+        graph.add_node("chebi", prefix="CHEBI")
+
+        :param identifier: The identifier value to potentially prefix
+        :param output_type: The output type to check for prefix
+        :return: The identifier with prefix applied if configured
+        """
+        # Check if the node has a prefix attribute
+        if output_type in self.graph.nodes():
+            node_data = self.graph.nodes[output_type]
+            if 'prefix' in node_data:
+                prefix = node_data['prefix']
+                identifier_str = str(identifier)
+                # Only add prefix if it's not already there
+                if not identifier_str.startswith(prefix + ":"):
+                    return f"{prefix}:{identifier_str}"
+
+        return str(identifier)
 
     def _valid_input_type(self, input_type):
         return input_type.lower() in self.graph.nodes()
@@ -213,13 +243,12 @@ class DataTransformMDB(DataTransform):
         for node in graph.nodes():
             if node != node.lower():
                 raise ValueError("node object {} is not lowercase".format(node))
-        for (vert1, vert2) in graph.edges():
-            if 'object' not in graph.edges[vert1, vert2].keys():
+        for vert1, vert2 in graph.edges():
+            if "object" not in graph.edges[vert1, vert2].keys():
                 raise ValueError("edge_object for ({}, {}) is missing".format(vert1, vert2))
-            edge_object = graph.edges[vert1, vert2]['object']
+            edge_object = graph.edges[vert1, vert2]["object"]
             if not isinstance(edge_object, DataTransformEdge):
-                raise ValueError("edge_object for ({}, {}) is of the wrong type".
-                                 format(vert1, vert2))
+                raise ValueError("edge_object for ({}, {}) is of the wrong type".format(vert1, vert2))
 
     def _precompute_paths(self):
         """
@@ -230,7 +259,7 @@ class DataTransformMDB(DataTransform):
         self.paths = {}
         for output_type in self.output_types:
             for input_type in self.input_types:
-                paths = [p for p in all_simple_paths(self.graph, input_type[0], output_type)]
+                paths = [p for p in nx.all_simple_paths(self.graph, input_type[0], output_type)]
                 if not paths:
                     try:
                         # this will try to find self-loops. all_shortest_paths() return one element,
@@ -241,8 +270,7 @@ class DataTransformMDB(DataTransform):
                             # p-to-p isn't defined
                             # pylint: disable=W0104
                             self.graph.edges[input_type[0], output_type]
-                            paths = [p*2 for p in all_shortest_paths(
-                                self.graph, input_type[0], output_type)]
+                            paths = [p * 2 for p in nx.all_shortest_paths(self.graph, input_type[0], output_type)]
                         except KeyError:
                             pass
                     except nx.NetworkXNoPath:
@@ -264,9 +292,9 @@ class DataTransformMDB(DataTransform):
             # in debug mode, skip all documents not in the debug list
             if self.debug:
                 # pylint: disable=C0121
-                if self.debug is True or doc['_id'] in self.debug:
+                if self.debug is True or doc["_id"] in self.debug:
                     # set debug information
-                    doc['dt_debug'] = {'orig_id': doc['_id']}
+                    doc["dt_debug"] = {"orig_id": doc["_id"]}
                     doc_lst.append(doc)
             else:
                 doc_lst.append(doc)
@@ -274,7 +302,7 @@ class DataTransformMDB(DataTransform):
         hit_lst = []
         miss_lst = []
         for doc in doc_lst:
-            if self.skip_w_regex and self.skip_w_regex.match(doc['_id']):
+            if self.skip_w_regex and self.skip_w_regex.match(doc["_id"]):
                 yield doc
             else:
                 miss_lst.append(doc)
@@ -292,7 +320,7 @@ class DataTransformMDB(DataTransform):
                         (hit_lst, miss_lst) = self.travel(input_type, output_type, miss_lst)
                     # or if copy is allowed, we get the value from the doc
                     elif self.copy_from_doc:
-                        (hit_lst, miss_lst) = self._copy(input_type, miss_lst)
+                        (hit_lst, miss_lst) = self._copy(input_type, output_type, miss_lst)
                 else:
                     (hit_lst, miss_lst) = self.travel(input_type, output_type, miss_lst)
 
@@ -305,19 +333,19 @@ class DataTransformMDB(DataTransform):
             for doc in miss_lst:
                 yield doc
 
-    def _copy(self, input_type, doc_lst):
+    def _copy(self, input_type, output_type, doc_lst):
         """Copy ids in the case where input_type == output_type"""
         hit_lst = []
         miss_lst = []
         for doc in doc_lst:
             val = nested_lookup(doc, input_type[1])
             if val:
-                # ensure _id is always a str
-                doc['_id'] = str(val)
+                # ensure _id is always a str and apply prefix if configured
+                doc["_id"] = self._apply_prefix(val, output_type)
                 hit_lst.append(doc)
                 # retain debug information if available (assumed dt_debug already in place)
                 if self.debug:
-                    doc['dt_debug']['copy_from'] = (input_type[1], val)
+                    doc["dt_debug"]["copy_from"] = (input_type[1], val)
             else:
                 miss_lst.append(doc)
         # Keep a record of IDs copied
@@ -332,8 +360,8 @@ class DataTransformMDB(DataTransform):
         """
         weight = 0
         for path_var in map(nx.utils.pairwise, [path]):
-            for (vert1, vert2) in path_var:
-                edge = self.graph.edges[vert1, vert2]['object']
+            for vert1, vert2 in path_var:
+                edge = self.graph.edges[vert1, vert2]["object"]
                 weight = weight + edge.weight
         return weight
 
@@ -371,19 +399,19 @@ class DataTransformMDB(DataTransform):
                 value = nested_lookup(doc, input_type[1])
                 for lookup_id in id_strct.find_left(value):
                     new_doc = copy.deepcopy(doc)
-                    # ensure _id is always a str
-                    new_doc['_id'] = str(lookup_id)
+                    # ensure _id is always a str and apply prefix if configured
+                    new_doc["_id"] = self._apply_prefix(lookup_id, target)
                     # capture debug information
                     if debug:
-                        new_doc['dt_debug']['start_field'] = input_type[1]
-                        new_doc['dt_debug']['debug'] = id_strct.get_debug(value)
+                        new_doc["dt_debug"]["start_field"] = input_type[1]
+                        new_doc["dt_debug"]["debug"] = id_strct.get_debug(value)
                     hit_lst.append(new_doc)
                     hit_flag = True
                 if not hit_flag:
                     miss_lst.append(doc)
             return hit_lst, miss_lst
 
-        #self.logger.debug("Travel From '{}' To '{}'".format(input_type[0], target))
+        # self.logger.debug("Travel From '{}' To '{}'".format(input_type[0], target))
 
         # Keep a running list of all saved hits
         saved_hits = IDStruct()
@@ -392,8 +420,8 @@ class DataTransformMDB(DataTransform):
         path_strct = _build_path_strct(input_type, doc_lst)
 
         for path in map(nx.utils.misc.pairwise, self.paths[(input_type[0], target)]):
-            for (vert1, vert2) in path:
-                edge = self.graph.edges[vert1, vert2]['object']
+            for vert1, vert2 in path:
+                edge = self.graph.edges[vert1, vert2]["object"]
                 num_input_ids = len(path_strct)
                 path_strct = self._edge_lookup(edge, path_strct)
                 num_output_ids = len(path_strct)

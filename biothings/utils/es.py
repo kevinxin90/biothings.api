@@ -1,72 +1,82 @@
 import copy
 import datetime
+import functools
 import itertools
 import json
-import re
-import time
-import functools
-
-from elasticsearch import (Elasticsearch, NotFoundError, RequestError,
-                           TransportError, ElasticsearchException)
-from elasticsearch import helpers
-from elasticsearch.serializer import JSONSerializer
-from importlib import import_module
-
-from biothings.utils.common import iter_n, splitstr, nan, inf, merge, traverse
-from biothings.utils.dataload import dict_walk
-from biothings.utils.serializer import to_json
 
 # setup ES logging
 import logging
+import re
+import time
+from importlib import import_module
+from typing import List, Mapping, Optional
+
+from elasticsearch import ApiError, Elasticsearch, NotFoundError, RequestError, TransportError, helpers
+from elasticsearch.serializer import JSONSerializer
+
+from biothings.utils.common import inf, iter_n, merge, nan, splitstr, traverse
+
+# the following imports used by utils.es.Database
+from biothings.utils.dataload import dict_walk, update_dict_recur
+from biothings.utils.dotfield import parse_dot_fields
+from biothings.utils.hub_db import IDatabase
+from biothings.utils.serializer import to_json
+
 formatter = logging.Formatter("%(levelname)s:%(name)s:%(message)s")
-es_logger = logging.getLogger('elasticsearch')
+es_logger = logging.getLogger("elasticsearch")
 es_logger.setLevel(logging.WARNING)
 ch = logging.StreamHandler()
 ch.setFormatter(formatter)
 es_logger.addHandler(ch)
 
-es_tracer = logging.getLogger('elasticsearch.trace')
+es_tracer = logging.getLogger("elasticsearch.trace")
 es_tracer.setLevel(logging.WARNING)
 ch = logging.StreamHandler()
 ch.setFormatter(formatter)
 es_tracer.addHandler(ch)
 
-def verify_ids(doc_iter, es_host, index, doc_type=None, step=100000, ):
-    '''verify how many docs from input interator/list overlapping with existing docs.'''
+
+def verify_ids(
+    doc_iter,
+    es_host,
+    index,
+    step=100000,
+):
+    """verify how many docs from input interator/list overlapping with existing docs."""
 
     index = index
-    doc_type = doc_type
     es = get_es(es_host)
-    q = {'query': {'ids': {"values": []}}}
+    q = {"query": {"ids": {"values": []}}}
     total_cnt = 0
     found_cnt = 0
     out = []
     for doc_batch in iter_n(doc_iter, n=step):
-        id_li = [doc['_id'] for doc in doc_batch]
+        id_li = [doc["_id"] for doc in doc_batch]
         # id_li = [doc['_id'].replace('chr', '') for doc in doc_batch]
-        q['query']['ids']['values'] = id_li
-        xres = es.search(index=index, doc_type=doc_type, body=q, _source=False)
-        found_cnt += xres['hits']['total']
+        q["query"]["ids"]["values"] = id_li
+        xres = es.search(index=index, body=q, source=False)
+        found_cnt += xres["hits"]["total"]
         total_cnt += len(id_li)
-        out.extend([x['_id'] for x in xres['hits']['hits']])
+        out.extend([x["_id"] for x in xres["hits"]["hits"]])
     return out
 
 
 def get_es(es_host, timeout=120, max_retries=3, retry_on_timeout=False):
-    es = Elasticsearch(es_host, timeout=timeout, max_retries=max_retries,
-                       retry_on_timeout=retry_on_timeout)
+    es = Elasticsearch(es_host, request_timeout=timeout, max_retries=max_retries, retry_on_timeout=retry_on_timeout)
     return es
 
 
+# WARNING: this wrapper changes the _index and _doc_type
+#  usually this is unwanted but we will leave it this way here
 def wrapper(func):
-    '''this wrapper allows passing index and doc_type from wrapped method.'''
+    """this wrapper allows passing index and doc_type from wrapped method."""
+
     def outter_fn(*args, **kwargs):
         self = args[0]
-        index = kwargs.pop('index', self._index)             # pylint: disable=protected-access
-        doc_type = kwargs.pop('doc_type', self._doc_type)    # pylint: disable=protected-access
-        self._index = index                                  # pylint: disable=protected-access
-        self._doc_type = doc_type                            # pylint: disable=protected-access
+        index = kwargs.pop("index", self._index)  # pylint: disable=protected-access
+        self._index = index  # pylint: disable=protected-access
         return func(*args, **kwargs)
+
     outter_fn.__doc__ = func.__doc__
     return outter_fn
 
@@ -74,9 +84,19 @@ def wrapper(func):
 class IndexerException(Exception):
     pass
 
-class ESIndex():
-    """ An Elasticsearch Index Wrapping A Client.
-    Counterpart for pymongo.collection.Collection """
+
+@functools.lru_cache()
+def get_doc_type(es_client, index_name):
+    if int(es_client.info()["version"]["number"].split(".")[0]) < 7:
+        mappings = es_client.indices.get_mapping(index=index_name)
+        mappings = mappings[index_name]["mappings"]
+        return next(iter(mappings.keys()))
+    return None
+
+
+class ESIndex:
+    """An Elasticsearch Index Wrapping A Client.
+    Counterpart for pymongo.collection.Collection"""
 
     # a new approach to biothings.utils.es.ESIndexer
     # but not intended to be a replacement in features.
@@ -86,13 +106,14 @@ class ESIndex():
         self.index_name = index_name  # MUST exist
 
     @property
-    @functools.lru_cache()
     def doc_type(self):
-        if int(self.client.info()['version']['number'].split('.')[0]) < 7:
-            mappings = self.client.indices.get_mapping(self.index_name)
-            mappings = mappings[self.index_name]["mappings"]
-            return next(iter(mappings.keys()))
-        return None
+        return get_doc_type(self.client, self.index_name)
+        # TODO: remove the code block below if the above works
+        # if int(self.client.info()["version"]["number"].split(".")[0]) < 7:
+        #     mappings = self.client.indices.get_mapping(self.index_name)
+        #     mappings = mappings[self.index_name]["mappings"]
+        #     return next(iter(mappings.keys()))
+        # return None
 
     # SUBCLASS NOTE &&
     # BEFORE YOU ADD A METHOD UNDER THIS CLASS:
@@ -104,7 +125,8 @@ class ESIndex():
     # ES library, thus only providing low-level common operations, like doc_type
     # parsing across ES versions for biothings usecases. (single type per index)
 
-class ESIndexer():
+
+class ESIndexer:
     # RETIRING THIS CLASS
 
     # --
@@ -112,49 +134,66 @@ class ESIndexer():
     # existing actual indices, the index referred here
     # can be an alias or does not exist.
 
-    def __init__(self, index, doc_type='_doc', es_host='localhost:9200',
-                 step=500, step_size=10,  # elasticsearch.helpers.bulk
-                 number_of_shards=1, number_of_replicas=0,
-                 check_index=True, **kwargs):
+    def __init__(
+        self,
+        index,
+        es_host="http://localhost:9200",
+        step=500,
+        step_size=10,  # elasticsearch.helpers.bulk
+        number_of_shards=1,
+        number_of_replicas=0,
+        check_index=True,
+        **kwargs,
+    ):
+        # some old caller may still pass doc_type, we will ignore it here since it's no longer used.
+        kwargs.pop("doc_type", None)
         self.es_host = es_host
         self._es = get_es(es_host, **kwargs)
-        self._host_major_ver = int(self._es.info()['version']['number'].split('.')[0])
+        self._host_major_ver = int(self._es.info()["version"]["number"].split(".")[0])
+        # the name of the index when ESIndexer is initialized
+        self.canonical_index_name = index
+        self._index = index  # placeholder, will be updated later
         if check_index:
             # if index is actually an alias, resolve the alias to
             # the real underlying index
-            try:
-                res = self._es.indices.get_alias(index=index)
-                # this was an alias
-                assert len(res) == 1, "Expecing '%s' to be an alias, but got nothing..." % index
-                self._index = list(res.keys())[0]
-            except NotFoundError:
-                # this was a real index name
-                self._index = index
-        self._doc_type = None
-        if doc_type:
-            self._doc_type = doc_type
-        else:
-            # assuming index exists, get mapping to discover doc_type
-            try:
-                m = self.get_mapping()
-                assert len(m) == 1, "Expected only one doc type, got: %s" % m.keys()
-                self._doc_type = list(m).pop()
-            except Exception as e:       # pylint: disable=broad-except
-                if check_index:
-                    logging.info("Failed to guess doc_type: %s", e)
-        self.number_of_shards = number_of_shards            # set number_of_shards when create_index
-        self.number_of_replicas = int(number_of_replicas)   # set number_of_replicas when create_index
-        self.step = step or 500   # the bulk size when doing bulk operation.
+            self.check_index()
+
+        # set number_of_shards when create_index
+        self.number_of_shards = number_of_shards
+        # set number_of_replicas when create_index
+        self.number_of_replicas = int(number_of_replicas)
+        self.step = step or 500  # the bulk size when doing bulk operation.
         self.step_size = (step_size or 10) * 1048576  # MB -> bytes
-        self.s = None      # number of records to skip, useful to continue indexing after an error.
+        # number of records to skip, useful to continue indexing after an error.
+        self.s = None
+
+    def check_index(self):
+        """
+        Check if index is an alias, and update self._index to point to
+        actual index
+
+        TODO: the overall design of ESIndexer is not great. If we are exposing ES
+         implementation details (such as the abilities to create and delete indices,
+         create and update aliases, etc.) to the user of this Class, then this method
+         doesn't seem that out of place.
+        """
+        try:
+            res = self._es.indices.get_alias(name=self.canonical_index_name)
+            # this is an alias
+            if len(res) != 1:
+                raise RuntimeError(f"Alias '{self.canonical_index_name}' does not associate with exactly 1 index")
+            self._index = list(res.keys())[0]
+        except NotFoundError:
+            # probably intended to be an index name
+            self._index = self.canonical_index_name
 
     @wrapper
     def get_biothing(self, bid, only_source=False, **kwargs):
-        rawdoc = self._es.get(index=self._index, id=bid, doc_type=self._doc_type, **kwargs)
+        rawdoc = self._es.get(index=self._index, id=bid, **kwargs)
         if not only_source:
             return rawdoc
         else:
-            doc = rawdoc['_source']
+            doc = rawdoc["_source"]
             doc["_id"] = rawdoc["_id"]
             return doc
 
@@ -163,29 +202,31 @@ class ESIndexer():
         """return True/False if a biothing id exists or not."""
         try:
             doc = self.get_biothing(bid, stored_fields=None)
-            return doc['found']
+            return doc["found"]
         except NotFoundError:
             return False
 
     @wrapper
     def mexists(self, bid_list):
-        q = {
-            "query": {
-                "ids": {
-                    "values": bid_list
-                }
-            }
-        }
-        res = self._es.search(index=self._index, doc_type=self._doc_type, body=q, stored_fields=None, size=len(bid_list))
+        q = {"query": {"ids": {"values": bid_list}}}
+        res = self._es.search(
+            index=self._index,
+            body=q,
+            stored_fields=None,
+            size=len(bid_list),
+        )
         # id_set = set([doc['_id'] for doc in res['hits']['hits']])     # TODO: Confirm this line
-        id_set = {doc['_id'] for doc in res['hits']['hits']}
+        id_set = {doc["_id"] for doc in res["hits"]["hits"]}
         return [(bid, bid in id_set) for bid in bid_list]
 
     @wrapper
     def count(self, q=None, raw=False):
         try:
-            _res = self._es.count(index=self._index, doc_type=self._doc_type, body=q)
-            return _res if raw else _res['count']
+            count_kwargs = {"index": self._index}
+            if q is not None:
+                count_kwargs.update({"q": q})
+            _res = self._es.count(**count_kwargs)
+            return _res if raw else _res["count"]
         except NotFoundError:
             return None
 
@@ -195,15 +236,7 @@ class ESIndexer():
             src = [src]
         cnt_d = {}
         for _src in src:
-            q = {
-                "query": {
-                    "constant_score": {
-                        "filter": {
-                            "exists": {"field": _src}
-                        }
-                    }
-                }
-            }
+            q = {"query": {"constant_score": {"filter": {"exists": {"field": _src}}}}}
             cnt_d[_src] = self.count(q)
         return cnt_d
 
@@ -211,194 +244,154 @@ class ESIndexer():
     def create_index(self, mapping=None, extra_settings=None):
         if not self._es.indices.exists(index=self._index):
             body = {
-                'settings': {
-                    'number_of_shards': self.number_of_shards,
+                "settings": {
+                    "number_of_shards": self.number_of_shards,
                     "number_of_replicas": self.number_of_replicas,
                 }
             }
             extra_settings = extra_settings or {}
+            self.sanitize_settings(extra_settings)
             body["settings"].update(extra_settings)
             if mapping:
-
                 # the mapping is passed in for elasticsearch 6
                 # if the remote server is of elasticsearch version 7 or later
                 # drop the doc_type first level key as it is no longer supported
                 self._populate_es_version()
                 if self._host_major_ver > 6:
-                    if len(mapping) == 1 and next(iter(mapping)) not in ('properties', 'dynamic', '_meta'):
+                    if len(mapping) == 1 and next(iter(mapping)) not in (
+                        "properties",
+                        "dynamic",
+                        "_meta",
+                    ):
                         mapping = next(iter(mapping.values()))
 
                 mapping = {"mappings": mapping}
                 body.update(mapping)
-            self._es.indices.create(index=self._index, body=body)
+            self._es.indices.create(index=self._index, **body)
 
     def _populate_es_version(self):
         if not hasattr(self, "_es_version"):
-            self._es_version = int(self._es.info()['version']['number'].split('.')[0])
+            self._es_version = int(self._es.info()["version"]["number"].split(".")[0])
 
-    @wrapper
-    def exists_index(self):
-        return self._es.indices.exists(index=self._index)
+    def exists_index(self, index: Optional[str] = None):
+        if not index:
+            index = self._index
+        return self._es.indices.exists(index=index)
 
-    def index(self, doc, id=None, action="index"):       # pylint: disable=redefined-builtin
-        '''add a doc to the index. If id is not None, the existing doc will be
-           updated.
-        '''
-        self._es.index(index=self._index, doc_type=self._doc_type, body=doc, id=id, params={"op_type": action})
+    def index(self, doc, id=None, op_type="index"):  # pylint: disable=redefined-builtin
+        """add a doc to the index. If id is not None, the existing doc will be
+        updated.
+        """
+        self._es.index(index=self._index, body=doc, id=id, op_type=op_type)
 
-    def index_bulk(self, docs, step=None, action='index'):
-
+    def index_bulk(self, docs, step=None, op_type="index"):
         self._populate_es_version()
         index_name = self._index
-        doc_type = self._doc_type
         step = step or self.step
 
         def _get_bulk(doc):
             # keep original doc
             ndoc = copy.copy(doc)
-            ndoc.update({
-                "_index": index_name,
-                "_type": doc_type,
-                "_op_type": action,
-            })
-            if self._host_major_ver > 6:
-                ndoc.pop("_type")
+            ndoc.update(
+                {
+                    "_index": index_name,
+                    "_op_type": op_type,
+                }
+            )
             return ndoc
+
         actions = (_get_bulk(doc) for doc in docs)
         num_ok, errors = helpers.bulk(self._es, actions, chunk_size=step, max_chunk_bytes=self.step_size)
         if errors:
-            raise ElasticsearchException("%d errors while bulk-indexing: %s" % (len(errors), [str(e) for e in errors]))
+            # Previously used ElasticsearchException but was removed in 8.x, updated with ApiError
+            raise ApiError("%d errors while bulk-indexing: %s" % (len(errors), [str(e) for e in errors]))
         return num_ok, errors
 
-    def delete_doc(self, id):                # pylint: disable=redefined-builtin
-        '''delete a doc from the index based on passed id.'''
-        return self._es.delete(index=self._index, doc_type=self._doc_type, id=id)
+    def delete_doc(self, id):  # pylint: disable=redefined-builtin
+        """delete a doc from the index based on passed id."""
+        return self._es.delete(index=self._index, id=id)
 
     def delete_docs(self, ids, step=None):
-        '''delete a list of docs in bulk.'''
+        """delete a list of docs in bulk."""
         index_name = self._index
-        doc_type = self._doc_type
         step = step or self.step
 
         def _get_bulk(_id):
-            if self._host_major_ver >= 7:
-                doc = {
-                    '_op_type': 'delete',
-                    "_index": index_name,
-                    "_id": _id
-                }
-            else:
-                doc = {
-                    '_op_type': 'delete',
-                    "_index": index_name,
-                    "_type": doc_type,
-                    "_id": _id
-                }
+            doc = {"_op_type": "delete", "_index": index_name, "_id": _id}
             return doc
+
         actions = (_get_bulk(_id) for _id in ids)
         return helpers.bulk(self._es, actions, chunk_size=step, stats_only=True, raise_on_error=False)
 
-    def delete_index(self):
-        self._es.indices.delete(index=self._index)
+    def delete_index(self, index=None):
+        if not index:
+            index = self._index
+        self._es.indices.delete(index=index)
 
-    def update(self, id, extra_doc, upsert=True):          # pylint: disable=redefined-builtin
-        '''update an existing doc with extra_doc.
-           allow to set upsert=True, to insert new docs.
-        '''
-        body = {'doc': extra_doc}
+    def update(self, id, extra_doc, upsert=True):  # pylint: disable=redefined-builtin
+        """update an existing doc with extra_doc.
+        allow to set upsert=True, to insert new docs.
+        """
+        body = {"doc": extra_doc}
         if upsert:
-            body['doc_as_upsert'] = True
-        return self._es.update(index=self._index, doc_type=self._doc_type, id=id, body=body)
+            body["doc_as_upsert"] = True
+        return self._es.update(index=self._index, id=id, body=body)
 
     def update_docs(self, partial_docs, upsert=True, step=None, **kwargs):
-        '''update a list of partial_docs in bulk.
-           allow to set upsert=True, to insert new docs.
-        '''
+        """update a list of partial_docs in bulk.
+        allow to set upsert=True, to insert new docs.
+        """
         index_name = self._index
-        doc_type = self._doc_type
         step = step or self.step
 
         def _get_bulk(doc):
-            if self._host_major_ver >= 7:
-                doc = {
-                    '_op_type': 'update',
-                    "_index": index_name,
-                    "_id": doc['_id'],
-                    "doc": doc
-                }
-            else:
-                doc = {
-                    '_op_type': 'update',
-                    "_index": index_name,
-                    "_type": doc_type,
-                    "_id": doc['_id'],
-                    "doc": doc
-                }
+            doc = {"_op_type": "update", "_index": index_name, "_id": doc["_id"], "doc": doc}
             if upsert:
-                doc['doc_as_upsert'] = True
+                doc["doc_as_upsert"] = True
             return doc
+
         actions = (_get_bulk(doc) for doc in partial_docs)
         return helpers.bulk(self._es, actions, chunk_size=step, **kwargs)
 
-    def get_mapping(self):
+    def get_mapping(self, with_doc_type=False):
         """return the current index mapping"""
-        if self._host_major_ver <= 6:
-            m = self._es.indices.get_mapping(
-                index=self._index,
-                doc_type=self._doc_type,
-            )
+        if self._host_major_ver >= 7:
+            m = self._es.indices.get_mapping(index=self._index)
+            if with_doc_type:
+                # use "_doc" as a fake doc_type to make it compatible with old behavior
+                # in case some caller expects a doc_type level key
+                return {"_doc": m[self._index]["mappings"]}
             return m[self._index]["mappings"]
-        elif self._host_major_ver == 7:
-            m = self._es.indices.get_mapping(
-                index=self._index
-            )
-            # fake the mapping doc_type
-            m = {
-                self._doc_type: m[self._index]["mappings"]
-            }
-            return m
-        else:
-            raise RuntimeError(f"Server Elasticsearch version is {self._host_major_ver} "
-                               "which is unsupported when using old ESIndexer class")
+        raise RuntimeError(
+            f"Server Elasticsearch version is {self._host_major_ver} "
+            "which is unsupported (must >=7) when using old ESIndexer class"
+        )
 
     def update_mapping(self, m):
-        if self._host_major_ver <= 6:
-            assert list(m) == [
-                self._doc_type], "Bad mapping format, should have one doc_type, got: %s" % list(
-                m)
-            assert 'properties' in m[
-                self._doc_type], "Bad mapping format, no 'properties' key"
-            return self._es.indices.put_mapping(
-                index=self._index, doc_type=self._doc_type, body=m
-            )
-        elif self._host_major_ver == 7:
+        if self._host_major_ver >= 7:
             # this is basically guessing based on heuristics
             if len(m) == 1:
-                if 'properties' not in m:  # basically {'_doc': mapping}
+                if "properties" not in m:  # basically {'_doc': mapping}
                     m = next(iter(m.values()))  # take out the mapping
                 else:  # basically just the mapping or type: properties
                     pass  # ignoring the possibility of doc_type='properties'
             else:  # we don't expect {} as input, so len(m) > 1
-                if 'properties' not in m:
+                if "properties" not in m:
                     raise RuntimeError(f"Possibly invalid mapping {m}")
             return self._es.indices.put_mapping(index=self._index, body=m)
         else:
-            raise RuntimeError(f"Server Elasticsearch version is {self._host_major_ver} "
-                               "which is unsupported when using old ESIndexer class")
+            raise RuntimeError(
+                f"Server Elasticsearch version is {self._host_major_ver} "
+                "which is unsupported (must >=7) when using old ESIndexer class"
+            )
 
     def get_mapping_meta(self):
         """return the current _meta field."""
         m = self.get_mapping()
-        doc_type = self._doc_type
-        if doc_type is None:
-            # fetch doc_type from mapping
-            assert len(m) == 1, "More than one doc_type found, not supported when self._doc_type " + \
-                                "is not initialized"
-            doc_type = list(m.keys())[0]
-        return {"_meta": m[doc_type]["_meta"]}
+        return {"_meta": m["_meta"]}
 
     def update_mapping_meta(self, meta):
-        allowed_keys = {'_meta', '_timestamp'}
+        allowed_keys = {"_meta", "_timestamp"}
         # if isinstance(meta, dict) and len(set(meta) - allowed_keys) == 0:
         if isinstance(meta, dict) and not set(meta) - allowed_keys:
             if self._host_major_ver >= 7:
@@ -406,54 +399,53 @@ class ESIndexer():
                     index=self._index,
                     body=meta,
                 )
-            else:  # not sure if _type needs to be specified
-                body = {self._doc_type: meta}
-                return self._es.indices.put_mapping(
-                    doc_type=self._doc_type,
-                    body=body,
-                    index=self._index
+            else:
+                raise RuntimeError(
+                    f"Server Elasticsearch version is {self._host_major_ver} "
+                    "which is unsupported (must >=7) when using old ESIndexer class"
                 )
         else:
             raise ValueError('Input "meta" should have and only have "_meta" field.')
 
+    def flush_and_refresh(self):
+        try:
+            self._es.indices.flush()
+            self._es.indices.refresh()
+        except:  # pylint: disable=bare-except  # noqa
+            pass
+
     @wrapper
     def build_index(self, collection, verbose=True, query=None, bulk=True, update=False, allow_upsert=True):
-        index_name = self._index
         # update some settings for bulk indexing
         body = {
             "index": {
-                "refresh_interval": "-1",              # disable refresh temporarily
+                "refresh_interval": "-1",  # disable refresh temporarily
                 "auto_expand_replicas": "0-all",
             }
         }
-        self._es.indices.put_settings(body=body, index=index_name)
+        self.update_settings(body)
         try:
             self._build_index_sequential(collection, verbose, query=query, bulk=bulk, update=update, allow_upsert=True)
         finally:
             # restore some settings after bulk indexing is done.
-            body = {
-                "index": {
-                    "refresh_interval": "1s"              # default settings
-                }
-            }
-            self._es.indices.put_settings(body=body, index=index_name)
+            body = {"index": {"refresh_interval": "1s"}}  # default settings
+            self.update_settings(body)
 
-            try:
-                self._es.indices.flush()
-                self._es.indices.refresh()
-            except:          # pylint: disable=bare-except  # noqa
-                pass
+            self.flush_and_refresh()
 
             time.sleep(1)
             src_cnt = collection.count(query)
             es_cnt = self.count()
             if src_cnt != es_cnt:
-                raise IndexerException("Total count of documents does not match [{}, should be {}]".format(es_cnt, src_cnt))
+                raise IndexerException(
+                    "Total count of documents does not match [{}, should be {}]".format(es_cnt, src_cnt)
+                )
 
-            return es_cnt
+            return es_cnt  # NOQA B012
 
-    def _build_index_sequential(self, collection, verbose=False, query=None, bulk=True, update=False, allow_upsert=True):
-
+    def _build_index_sequential(
+        self, collection, verbose=False, query=None, bulk=True, update=False, allow_upsert=True
+    ):
         def rate_control(cnt, t):
             delay = 0
             if t > 90:
@@ -464,6 +456,7 @@ class ESIndexer():
                 time.sleep(delay)
 
         from biothings.utils.mongo import doc_feeder
+
         src_docs = doc_feeder(collection, step=self.step, s=self.s, batch_callback=rate_control, query=query)
         if bulk:
             if update:
@@ -487,55 +480,33 @@ class ESIndexer():
 
     @wrapper
     def optimize(self, max_num_segments=1):
-        '''optimize the default index.'''
+        """optimize the default index."""
         params = {
-            "wait_for_merge": False,
+            "wait_for_completion": False,
             "max_num_segments": max_num_segments,
         }
-        return self._es.indices.forcemerge(index=self._index, params=params)
+        return self._es.indices.forcemerge(index=self._index, **params)
 
     def clean_field(self, field, dryrun=True, step=5000):
-        '''remove a top-level field from ES index, if the field is the only field of the doc,
-           remove the doc as well.
-           step is the size of bulk update on ES
-           try first with dryrun turned on, and then perform the actual updates with dryrun off.
-        '''
+        """remove a top-level field from ES index, if the field is the only field of the doc,
+        remove the doc as well.
+        step is the size of bulk update on ES
+        try first with dryrun turned on, and then perform the actual updates with dryrun off.
+        """
         if self._host_major_ver >= 7:
-            raise RuntimeError("clean_field is no longer supported")
-        q = {
-            "query": {
-                "constant_score": {
-                    "filter": {
-                        "exists": {
-                            "field": field
-                        }
-                    }
-                }
-            }
-        }
+            raise RuntimeError("clean_field is no longer supported")  # It may still work, but untested yet
+        q = {"query": {"constant_score": {"filter": {"exists": {"field": field}}}}}
         cnt_orphan_doc = 0
         cnt = 0
         _li = []
         for doc in self.doc_feeder(query=q):
-            if set(doc) == {'_id', field}:
+            if set(doc) == {"_id", field}:
                 cnt_orphan_doc += 1
                 # delete orphan doc
-                _li.append({
-                    "delete": {
-                        "_index": self._index,
-                        "_type": self._doc_type,
-                        "_id": doc['_id']
-                    }
-                })
+                _li.append({"delete": {"_index": self._index, "_id": doc["_id"]}})
             else:
                 # otherwise, just remove the field from the doc
-                _li.append({
-                    "update": {
-                        "_index": self._index,
-                        "_type": self._doc_type,
-                        "_id": doc['_id']
-                    }
-                })
+                _li.append({"update": {"_index": self._index, "_id": doc["_id"]}})
                 # this script update requires "script.disable_dynamic: false" setting
                 # in elasticsearch.yml
                 _li.append({"script": 'ctx._source.remove("{}")'.format(field)})
@@ -552,27 +523,34 @@ class ESIndexer():
         return {"total": cnt, "updated": cnt - cnt_orphan_doc, "deleted": cnt_orphan_doc}
 
     @wrapper
-    def doc_feeder_using_helper(self, step=None, verbose=True, query=None, scroll='10m', **kwargs):
+    def doc_feeder_using_helper(self, step=None, verbose=True, query=None, scroll="10m", **kwargs):
         # verbose unimplemented
         step = step or self.step
-        q = query if query else {'query': {'match_all': {}}}
-        for rawdoc in helpers.scan(client=self._es, query=q, scroll=scroll, index=self._index,
-                                   doc_type=self._doc_type, **kwargs):
-            if rawdoc.get('_source', False):
-                doc = rawdoc['_source']
+        q = query if query else {"query": {"match_all": {}}}
+        for rawdoc in helpers.scan(
+            client=self._es,
+            query=q,
+            scroll=scroll,
+            index=self._index,
+            **kwargs,
+        ):
+            if rawdoc.get("_source", False):
+                doc = rawdoc["_source"]
                 doc["_id"] = rawdoc["_id"]
                 yield doc
             else:
                 yield rawdoc
 
     @wrapper
-    def doc_feeder(self, step=None, verbose=True, query=None, scroll='10m', only_source=True, **kwargs):
+    def doc_feeder(self, step=None, verbose=True, query=None, scroll="10m", only_source=True, **kwargs):
         step = step or self.step
-        q = query if query else {'query': {'match_all': {}}}
+        q = query if query else {"query": {"match_all": {}}}
         _q_cnt = self.count(q=q, raw=True)
-        n = _q_cnt['count']
-        n_shards = _q_cnt['_shards']['total']
-        assert n_shards == _q_cnt['_shards']['successful']
+        if not _q_cnt:
+            return
+        n = _q_cnt["count"]
+        n_shards = _q_cnt["_shards"]["total"]
+        assert n_shards == _q_cnt["_shards"]["successful"]
         # Not sure if scroll size is per shard anymore in the new ES...should check this
         _size = int(step / n_shards)
         assert _size * n_shards == step
@@ -581,72 +559,75 @@ class ESIndexer():
         # if verbose:
         #     t1 = time.time()
 
-        res = self._es.search(index=self._index, doc_type=self._doc_type, body=q,
-                              size=_size, search_type='scan', scroll=scroll, **kwargs)
+        res = self._es.search(
+            index=self._index,
+            body=q,
+            size=_size,
+            search_type="scan",
+            scroll=scroll,
+            **kwargs,
+        )
         # double check initial scroll request returns no hits
         # assert len(res['hits']['hits']) == 0
-        assert not res['hits']['hits']
+        assert not res["hits"]["hits"]
 
         while True:
             # if verbose:
             #     t1 = time.time()
-            res = self._es.scroll(scroll_id=res['_scroll_id'], scroll=scroll)
+            res = self._es.scroll(scroll_id=res["_scroll_id"], scroll=scroll)
             # if len(res['hits']['hits']) == 0:
-            if not res['hits']['hits']:
+            if not res["hits"]["hits"]:
                 break
             else:
-                for rawdoc in res['hits']['hits']:
-                    if rawdoc.get('_source', False) and only_source:
-                        doc = rawdoc['_source']
+                for rawdoc in res["hits"]["hits"]:
+                    if rawdoc.get("_source", False) and only_source:
+                        doc = rawdoc["_source"]
                         doc["_id"] = rawdoc["_id"]
                         yield doc
                     else:
                         yield rawdoc
                     cnt += 1
 
-        assert cnt == n, "Error: scroll query terminated early [{}, {}], please retry.\nLast response:\n{}".format(cnt, n, res)
+        assert cnt == n, "Error: scroll query terminated early [{}, {}], please retry.\nLast response:\n{}".format(
+            cnt, n, res
+        )
 
     @wrapper
     def get_id_list(self, step=None, verbose=True):
         step = step or self.step
         cur = self.doc_feeder(step=step, _source=False, verbose=verbose)
         for doc in cur:
-            yield doc['_id']
+            yield doc["_id"]
 
     @wrapper
     def get_docs(self, ids, step=None, only_source=True, **mget_args):
-        ''' Return matching docs for given ids iterable, if not found return None.
-            A generator is returned to the matched docs.  If only_source is False,
-            the entire document is returned, otherwise only the source is returned. '''
+        """Return matching docs for given ids iterable, if not found return None.
+        A generator is returned to the matched docs.  If only_source is False,
+        the entire document is returned, otherwise only the source is returned."""
         # chunkify
         step = step or self.step
         for chunk in iter_n(ids, step):
-            if self._host_major_ver > 6:
-                chunk_res = self._es.mget(body={"ids": chunk}, index=self._index,
-                                          **mget_args)
-            else:
-                chunk_res = self._es.mget(body={"ids": chunk}, index=self._index,
-                                          doc_type=self._doc_type, **mget_args)
-            for rawdoc in chunk_res['docs']:
-                if (('found' not in rawdoc) or (('found' in rawdoc) and not rawdoc['found'])):
+            chunk_res = self._es.mget(body={"ids": chunk}, index=self._index, **mget_args)
+            for rawdoc in chunk_res["docs"]:
+                if ("found" not in rawdoc) or (("found" in rawdoc) and not rawdoc["found"]):
                     continue
                 elif not only_source:
                     yield rawdoc
                 else:
-                    doc = rawdoc['_source']
+                    doc = rawdoc["_source"]
                     doc["_id"] = rawdoc["_id"]
                     yield doc
 
-    def find_biggest_doc(self, fields_li, min=5, return_doc=False):     # pylint: disable=redefined-builtin
+    def find_biggest_doc(self, fields_li, min=5, return_doc=False):  # pylint: disable=redefined-builtin
         """return the doc with the max number of fields from fields_li."""
         for n in range(len(fields_li), min - 1, -1):
             for field_set in itertools.combinations(fields_li, n):
-                q = ' AND '.join(["_exists_:" + field for field in field_set])
-                q = {'query': {"query_string": {"query": q}}}
+                q = " AND ".join(["_exists_:" + field for field in field_set])
+                q = {"query": {"query_string": {"query": q}}}
                 cnt = self.count(q)
-                if cnt > 0:
+                if cnt and cnt > 0:
                     if return_doc:
-                        res = self._es.search(index=self._index, doc_type=self._doc_type, body=q, size=cnt)
+                        res = self._es.search(index=self._index, body=q, size=cnt)
                         return res
                     else:
                         return (cnt, q)
@@ -654,7 +635,7 @@ class ESIndexer():
     def snapshot(self, repo, snapshot, mode=None, **params):
         body = {
             "indices": self._index,
-            "include_global_state": False
+            "include_global_state": False,
             # there is no reason to include global state in our application
             # we want to separate the staging env from the production env
             # (global state includes index templates and ingest pipeline)
@@ -664,23 +645,27 @@ class ESIndexer():
         if mode == "purge":
             # Note: this works, just for small one when deletion is done instantly
             try:
-                self._es.snapshot.get(repo, snapshot)
+                self._es.snapshot.get(repository=repo, snapshot=snapshot)
                 # if we can get it, we have to delete it
-                self._es.snapshot.delete(repo, snapshot)
+                self._es.snapshot.delete(repository=repo, snapshot=snapshot)
             except NotFoundError:
                 # ok, nothing to delete/purge
                 pass
         try:
-            return self._es.snapshot.create(repo, snapshot, body=body, params=params)
+            return self._es.snapshot.create(repository=repo, snapshot=snapshot, body=body, **params)
         except RequestError as e:
             try:
-                err_msg = e.info['error']['reason']
+                err_msg = e.info["error"]["reason"]
             except KeyError:
                 err_msg = e.error
             raise IndexerException("Can't snapshot '%s': %s" % (self._index, err_msg))
 
-    def restore(self, repo_name, snapshot_name, index_name=None, purge=False, body=None):
-        index_name = index_name or snapshot_name
+    def restore(self, repo_name, snapshot_name, index_name=None, purge=False):
+        indices = self.get_indices_from_snapshots(repo_name, snapshot_name)
+        if not index_name:
+            index_name = indices[0]
+        indices = ",".join(indices)
+
         if purge:
             try:
                 self._es.indices.get(index=index_name)
@@ -692,31 +677,161 @@ class ESIndexer():
         try:
             # this is just about renaming index within snapshot to index_name
             body = {
-                "indices": snapshot_name,   # snaphost name is the same as index in snapshot
+                "indices": indices,
                 "rename_replacement": index_name,
                 "ignore_unavailable": True,
                 "rename_pattern": "(.+)",
-                "include_global_state": True
+                # set to False, snapshots were created without global state anyway.
+                #  In ES8, an error will be raised if set to True
+                "include_global_state": False,
             }
-            return self._es.snapshot.restore(repo_name, snapshot_name, body=body)
+            return self._es.snapshot.restore(repository=repo_name, snapshot=snapshot_name, body=body)
         except TransportError as e:
-            raise IndexerException("Can't restore snapshot '%s' (does index '%s' already exist ?): %s" %
-                                   (snapshot_name, index_name, e))
+            raise IndexerException(
+                "Can't restore snapshot '%s' (does index '%s' already exist ?): %s" % (snapshot_name, index_name, e)
+            )
+
+    def get_alias(self, index: str = None, alias_name: str = None) -> List[str]:
+        """
+        Get indices with alias associated with given index name or alias name
+
+        Args:
+            index: name of index
+            alias_name: name of alias
+
+        Returns:
+            Mapping of index names with their aliases
+        """
+        return self._es.indices.get_alias(index=index, name=alias_name)
+
+    def get_settings(self, index: str = None) -> Mapping[str, Mapping]:
+        """
+        Get indices with settings associated with given index name
+
+        Args:
+            index: name of index
+
+        Returns:
+            Mapping of index names with their settings
+        """
+        return self._es.indices.get_settings(index=index)
+
+    def get_indice_names_by_settings(self, index: str = None, sort_by_creation_date=False, reverse=False) -> List[str]:
+        """
+        Get list of indices names associated with given index name, using indices' settings
+
+        Args:
+            index: name of index
+            sort_by_creation_date: sort the result by indice's creation_date
+            reverse: control the direction of the sorting
+
+        Returns:
+            list of index names (str)
+        """
+        indices_settings = self.get_settings(index)
+        names_with_creation_date = [
+            (indice_name, setting["settings"]["index"]["creation_date"])
+            for indice_name, setting in indices_settings.items()
+        ]
+
+        if sort_by_creation_date:
+            names_with_creation_date = sorted(
+                names_with_creation_date,
+                key=lambda name_with_creation_date: name_with_creation_date[1],
+                reverse=reverse,
+            )
+
+        indice_names = [name for name, _ in names_with_creation_date]
+        return indice_names
+
+    def update_alias(self, alias_name: str, index: Optional[str] = None):
+        """
+        Create or update an ES alias pointing to an index
+
+        Creates or updates an alias in Elasticsearch, associated with the
+        given index name or the underlying index of the ESIndexer instance.
+
+        When the alias name does not exist, it will be created. If an existing
+        alias already exists, it will be updated to only associate with the
+        index.
+
+        When the alias name already exists, an exception will be raised,
+        UNLESS the alias name is the same as index name that the ESIndexer is
+        initialized with. In this case, the existing index with the name
+        collision will be deleted, and the alias will be created
+        in its place. This feature is intended for seamless migration from
+        an index to an alias associated with an index for zero-downtime
+        installs.
+
+        Args:
+            alias_name: name of the alias
+            index: name of the index to associate with alias. If None, the
+                index of the ESIndexer instance is used.
+
+        Raises:
+            IndexerException
+        """
+        if index is None:
+            index = self._index
+
+        if not self._es.indices.exists(index=alias_name):
+            # case 1 it does not already exist
+            #  create the alias pointing to _index
+            self._es.indices.put_alias(index=index, name=alias_name)
+        else:  # case 2 it already exists
+            if self._es.indices.exists_alias(name=alias_name):
+                # if it is an alias, blindly update
+                #  This removes any other indices associated with the alias
+                actions = {"actions": [{"add": {"index": index, "alias": alias_name}}]}
+                removes = [
+                    {"remove": {"index": index_name, "alias": alias_name}} for index_name in self.get_alias(alias_name)
+                ]
+                actions["actions"].extend(removes)
+                self._es.indices.update_aliases(body=actions)
+            else:  # it is an index
+                # if not _index and is the canonical index name
+                #  then delete the index and create alias
+                if alias_name == self.canonical_index_name:
+                    self._es.indices.delete(index=alias_name)
+                    self._es.indices.put_alias(index=index, name=alias_name)
+                else:
+                    raise IndexerException(
+                        f"Cannot create alias {alias_name} an index with the same name already exists"
+                    )
 
     def get_repository(self, repo_name):
         try:
-            return self._es.snapshot.get_repository(repo_name)
+            return self._es.snapshot.get_repository(name=repo_name)
         except NotFoundError:
             raise IndexerException("Repository '%s' doesn't exist" % repo_name)
 
     def create_repository(self, repo_name, settings):
         try:
-            self._es.snapshot.create_repository(repo_name, settings)
+            self._es.snapshot.create_repository(name=repo_name, settings=settings)
         except TransportError as e:
             raise IndexerException("Can't create snapshot repository '%s': %s" % (repo_name, e))
 
+    def get_snapshots(self, repo_name, snapshot_name):
+        try:
+            snapshots = self._es.snapshot.get(repository=repo_name, snapshot=snapshot_name)
+            return [snapshot for snapshot in snapshots["snapshots"]]
+        except NotFoundError as ex:
+            message = str(ex)
+            if ex.error == "repository_missing_exception":
+                message = "Repository '%s' doesn't exist" % repo_name
+            if ex.error == "snapshot_missing_exception":
+                message = "Snapshot '%s' doesn't exist" % snapshot_name
+            raise IndexerException(message)
+
+    def get_indices_from_snapshots(self, repo_name, snapshot_name):
+        snapshots = self.get_snapshots(repo_name, snapshot_name)
+        indices = []
+        for snapshot in snapshots:
+            indices.extend([index for index in (snapshot.get("indices") or [])])
+        return indices
+
     def get_snapshot_status(self, repo, snapshot):
-        return self._es.snapshot.status(repo, snapshot)
+        return self._es.snapshot.status(repository=repo, snapshot=snapshot)
 
     def get_restore_status(self, index_name=None):
         index_name = index_name or self._index
@@ -730,11 +845,95 @@ class ESIndexer():
         if set(shards_status) == {"DONE"}:
             return {"status": "DONE", "progress": "100%"}
         else:
-            return {"status": "IN_PROGRESS", "progress": "%.2f%%" % (done/len(shards_status)*100)}
+            return {
+                "status": "IN_PROGRESS",
+                "progress": "%.2f%%" % (done / len(shards_status) * 100),
+            }
+
+    def get_internal_number_of_replicas(self):
+        try:
+            index_settings = self._es.indices.get_settings(index=self._index)
+            return index_settings[self._index]["settings"]["index"]["number_of_replicas"]
+        except Exception:
+            return
+
+    def set_internal_number_of_replicas(self, number_of_replicas=None):
+        if not number_of_replicas:
+            number_of_replicas = self.number_of_replicas
+        settings = {"index": {"number_of_replicas": number_of_replicas}}
+        self.update_settings(settings)
+
+    def sanitize_settings(self, settings):
+        """
+        Clean up settings dictinary to remove those static fields cannot be updated.
+         like: "uuid", "provided_name", "creation_date", "version",
+        settings will be updated  both in-place and returned as well.
+        """
+        setting_fields_to_remove = [
+            "uuid",
+            "provided_name",
+            "creation_date",
+            "version",
+            "number_of_shards",
+        ]
+        for field in setting_fields_to_remove:
+            settings["index"].pop(field, None)
+        return settings
+
+    def update_settings(self, settings, close=False, **params):
+        """
+        Parameters:
+            - settings: should be valid ES index's settings.
+            - close: In order to update static settings, the index must be closed first.
+
+        Ref: https://www.elastic.co/guide/en/elasticsearch/reference/7.17/index-modules.html#index-modules-settings
+        """
+        # Some static fields like: "uuid", "provided_name", "creation_date", "version",
+        #   "number_of_shards", which ES doesn't allow update them.
+        self.sanitize_settings(settings)
+
+        if close:
+            self.close()
+
+        self._es.indices.put_settings(
+            body=settings,
+            index=self._index,
+            **params,
+        )
+
+        if close:
+            self.open()
+
+    def reindex(self, src_index, is_remote=False, **kwargs):
+        """In order to reindex from remote,
+        - src es_host must be set to an IP which the current ES host can connect to.
+            It means that if 2 indices locate in same host, the es_host can be set to localhost,
+            but if they are in different hosts, an IP must be used instead.
+        - If src host uses SSL, https must be included in es_host. Eg: https://192.168.1.10:9200
+        - src host must be whitelisted in the current ES host.
+            Ref: https://www.elastic.co/guide/en/elasticsearch/reference/7.17/reindex-upgrade-remote.html
+        """
+        body = {
+            "source": {"index": src_index._index},
+            "dest": {"index": self._index},
+        }
+        if is_remote:
+            host = src_index.es_host
+            if not host.startswith("http"):
+                host = "http://" + host
+            body["source"]["remote"] = {"host": host}
+        return self._es.reindex(body=body, **kwargs)
+
+    def close(self):
+        self._es.indices.close(index=self._index)
+
+    def open(self):
+        self._es.indices.open(index=self._index)
 
 
 class MappingError(Exception):
     pass
+
 
 def generate_es_mapping(inspect_doc, init=True, level=0):
     """Generate an ES mapping according to "inspect_doc", which is
@@ -743,7 +942,10 @@ def generate_es_mapping(inspect_doc, init=True, level=0):
         int: {"type": "integer"},
         bool: {"type": "boolean"},
         float: {"type": "float"},
-        str: {"type": "keyword", "normalizer": "keyword_lowercase_normalizer"},    # not splittable (like an ID for instance)
+        str: {
+            "type": "keyword",
+            "normalizer": "keyword_lowercase_normalizer",
+        },  # not splittable (like an ID for instance)
         splitstr: {"type": "text"},
     }
     # inspect_doc, if it's been jsonified, contains keys with type as string,
@@ -755,11 +957,12 @@ def generate_es_mapping(inspect_doc, init=True, level=0):
         if isinstance(k, str):
             mat = pat.findall(k)
             if mat:
-                return eval(mat[0])     # actual type
+                return eval(mat[0])  # actual type
             else:
                 return k
         else:
             return k
+
     inspect_doc = dict_walk(inspect_doc, str2type)
 
     mapping = {}
@@ -778,7 +981,7 @@ def generate_es_mapping(inspect_doc, init=True, level=0):
             continue
         if rootk == "_stats":
             continue
-        if isinstance(rootk, type(None)):     # if rootk == type(None):
+        if isinstance(rootk, type(None)):  # if rootk == type(None):
             # value can be null, just skip it
             continue
         # some inspect report have True as value, others have dict (will all have dict eventually)
@@ -799,14 +1002,16 @@ def generate_es_mapping(inspect_doc, init=True, level=0):
                 # we want to make sure that, whatever the structure, the types involved were the same
                 # Exception: None is allowed with other types (translates to 'null' in ES)
                 # other_types = set([k for k in toexplore.keys() if k != list and isinstance(k, type) and k is not type(None)])    # TODO: Confirm this line
-                other_types = {k for k in toexplore.keys() if k != list and isinstance(k, type) and not isinstance(k, none_type)}
+                other_types = {
+                    k for k in toexplore.keys() if k != list and isinstance(k, type) and not isinstance(k, none_type)
+                }
                 # some mixes are allowed by ES
                 if {int, float}.issubset(other_types):
-                    other_types.discard(int)    # float > int
+                    other_types.discard(int)  # float > int
                     toexplore.pop(int)
                 if len(other_types) > 1:
                     raise Exception("Mixing types for key '%s': %s" % (rootk, other_types))
-            res = generate_es_mapping(toexplore, init=False, level=level+1)
+            res = generate_es_mapping(toexplore, init=False, level=level + 1)
             # is it the only key or do we have more ? (ie. some docs have data as "x", some
             # others have list("x")
             # list was either a list of values (end of tree) or a list of dict. Depending
@@ -844,65 +1049,83 @@ def generate_es_mapping(inspect_doc, init=True, level=0):
             return map_tpl[typ]
         else:
             mapping[rootk] = {"properties": {}}
-            mapping[rootk]["properties"] = generate_es_mapping(inspect_doc[rootk], init=False, level=level+1)
+            mapping[rootk]["properties"] = generate_es_mapping(inspect_doc[rootk], init=False, level=level + 1)
     if errors:
         raise MappingError("Error while generating mapping", errors)
     return mapping
 
 
-######################@#
+# from biothings.utils.common import json_serial
+# from biothings.utils.dataload import update_dict_recur
+# from biothings.utils.dotfield import parse_dot_fields
+
+########################
 # ES as HUB DB backend #
-#@######################
-from biothings.utils.hub_db import IDatabase
-from biothings.utils.dotfield import parse_dot_fields
-from biothings.utils.dataload import update_dict_recur
-from biothings.utils.common import json_serial
+########################
+# from biothings.utils.hub_db import IDatabase
 
 
 def get_hub_db_conn():
     return Database()
 
+
 def get_src_conn():
     return get_hub_db_conn()
+
+
+def get_src_db(conn=None):
+    db = Database()
+    return db[db.CONFIG.DATA_SRC_DATABASE]
+
 
 def get_src_dump():
     db = Database()
     return db[db.CONFIG.DATA_SRC_DUMP_COLLECTION]
 
+
 def get_src_master():
     db = Database()
     return db[db.CONFIG.DATA_SRC_MASTER_COLLECTION]
+
 
 def get_src_build():
     db = Database()
     return db[db.CONFIG.DATA_SRC_BUILD_COLLECTION]
 
+
 def get_src_build_config():
     db = Database()
     return db[db.CONFIG.DATA_SRC_BUILD_CONFIG_COLLECTION]
+
 
 def get_data_plugin():
     db = Database()
     return db[db.CONFIG.DATA_PLUGIN_COLLECTION]
 
+
 def get_api():
     db = Database()
     return db[db.CONFIG.API_COLLECTION]
+
 
 def get_cmd():
     db = Database()
     return db[db.CONFIG.CMD_COLLECTION]
 
+
 def get_event():
     db = Database()
     return db[db.CONFIG.EVENT_COLLECTION]
+
 
 def get_hub_config():
     db = Database()
     return db[getattr(db.CONFIG, "HUB_CONFIG_COLLECTION", "hub_config")]
 
+
 def get_source_fullname(col_name):
     return col_name
+
 
 def get_last_command():
     cmds = list(sorted(get_cmd()._read().values(), key=lambda cmd: cmd["_id"]))
@@ -913,9 +1136,9 @@ def get_last_command():
 # IS *NOT* DESIGNED FOR
 # MANAGING HEAVY WORKLOADS
 
-class Database(IDatabase):
 
-    CONFIG = None   # will be set by bt.utils.hub_db.setup()
+class Database(IDatabase):
+    CONFIG = None  # will be set by bt.utils.hub_db.setup()
 
     def __init__(self):
         super(Database, self).__init__()
@@ -924,15 +1147,14 @@ class Database(IDatabase):
         self.client = Elasticsearch(self.host, serializer=_HubDBEncoder())
 
         if not self.client.indices.exists(index=self.name):
-            self.client.indices.create(index=self.name, body={
-                'settings': {
-                    'number_of_shards': 1,
+            self.client.indices.create(
+                index=self.name,
+                settings={
+                    "number_of_shards": 1,
                     "number_of_replicas": 0,
                 },
-                'mappings': {
-                    "enabled": False
-                }
-            })
+                mappings={"enabled": False},
+            )
 
     @property
     def address(self):
@@ -942,16 +1164,16 @@ class Database(IDatabase):
     # ON "COLLECTION"
 
     def _exists(self, _id):
-        return self.client.exists(self.name, _id)
+        return self.client.exists(index=self.name, id=_id)
 
     def _read(self, _id):
-        doc = self.client.get(self.name, _id)
+        doc = self.client.get(index=self.name, id=_id)
         return doc["_source"]
 
     def _write(self, _id, doc):
         assert doc.pop("_id", None) in (_id, None)
-        self.client.index(self.name, doc, id=_id)
-        self.client.indices.refresh(self.name)
+        self.client.index(index=self.name, document=doc, id=_id)
+        self.client.indices.refresh(index=self.name)
 
     def _modify(self, _id, func):
         doc = self._read(_id)
@@ -968,8 +1190,7 @@ class Database(IDatabase):
         return Collection(colname, self)
 
 
-class Collection():
-
+class Collection:
     def __init__(self, colname, db):
         self.name = colname
         self.db = db
@@ -993,6 +1214,7 @@ class Collection():
     def _write_one(self, doc):
         def func(collection):
             collection[str(doc["_id"])] = doc
+
         self.db._modify(self.name, func)
 
     # HUB_DB ABSTRACTION
@@ -1005,7 +1227,6 @@ class Collection():
         return results[0] if results else None
 
     def find(self, filter=None, projection=None, *args, **kwargs):
-
         if args or kwargs:
             raise NotImplementedError()
 
@@ -1029,7 +1250,6 @@ class Collection():
         return results
 
     def insert_one(self, document, *args, **kwargs):
-
         if args or kwargs:
             raise NotImplementedError()
 
@@ -1039,7 +1259,6 @@ class Collection():
         self._write_one(document)
 
     def replace_one(self, filter, replacement, upsert=False, *args, **kwargs):
-
         if args or kwargs:
             raise NotImplementedError()
 
@@ -1056,7 +1275,6 @@ class Collection():
     # for partial document editing
 
     def _update_one(self, doc, update, *args, **kwargs):
-
         if args or kwargs:
             raise NotImplementedError()
 
@@ -1109,7 +1327,6 @@ class Collection():
         self._write_one(doc)
 
     def update_one(self, filter, update, upsert=False, *args, **kwargs):
-
         doc = self.find_one(filter) or {}
         if not (doc or upsert):
             raise ValueError("No Match.")
@@ -1117,7 +1334,6 @@ class Collection():
         self._update_one(doc, update, *args, **kwargs)
 
     def update_many(self, filter, update, upsert=False, *args, **kwargs):
-
         docs = self.find(filter)
         if not docs and upsert:
             if any("." in k for k in filter):
@@ -1154,6 +1370,7 @@ class Collection():
         # Use count_documents() or estimated_document_count() instead.
         return len(self._read())
 
+
 # JSON <-> BSON
 # -----------------
 # The original author of the biothings.hub decided to have the interface
@@ -1177,7 +1394,6 @@ class Collection():
 
 
 def _pyobj(doc):  # ES doc -> Python object
-
     for _, _doc in traverse(doc):
         if isinstance(_doc, dict):
             for k, v in list(_doc.items()):
@@ -1198,7 +1414,7 @@ def _eval(v):
             clsstr = match.group(1)
             modstr = clsstr.rsplit(".", 1)[0]
             return eval(v, {modstr: import_module(modstr)})
-    except:
+    except Exception:
         ...
 
     return v

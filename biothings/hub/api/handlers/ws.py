@@ -1,10 +1,11 @@
-import logging
 import asyncio
 import json
-
-from biothings.utils.hub_db import ChangeListener
+import logging
 
 import sockjs.tornado
+
+from biothings.utils.common import get_loop
+from biothings.utils.hub_db import ChangeListener
 
 
 class WebSocketConnection(sockjs.tornado.SockJSConnection):
@@ -25,7 +26,7 @@ class WebSocketConnection(sockjs.tornado.SockJSConnection):
           pconn = partial(WebSocketConnection,listeners=listeners)
           ws_router = sockjs.tornado.SockJSRouter(pconn,"/path")
         """
-        if type(listeners) != list:
+        if not isinstance(listeners, list):
             listeners = [listeners]
         self.listeners = listeners
         # propagate connection so listeners can access it and trigger message sending
@@ -43,24 +44,27 @@ class WebSocketConnection(sockjs.tornado.SockJSConnection):
         self.__class__.clients.add(self)
 
     def on_message(self, message):
-        err = None
-        strerr = None
+        err_to_raise = None
+        err_note = None
         try:
             message = json.loads(message)
             if message["op"] == "ping":
                 self.send({"op": "pong"})
-        except json.JSONDecodeError:
-            strerr = "malformed json message: %s" % message
-            err = json.JSONDecodeError(strerr)
-        except KeyError:
-            strerr = "malformed socket message: %s" % message
-            err = KeyError(strerr)
-        except Exception as e:
-            strerr = "Unable to process message '%s': %s" % (message, e)
-            err = Exception(strerr)
-        if err:
-            self.send({"error": strerr})
-            raise err
+        except json.JSONDecodeError as err:
+            err_note = "malformed json message: %s" % message
+            err.add_note(err_note)
+            err_to_raise = err  # we need to assign it here, otherwise it's lost outside of this block
+        except KeyError as err:
+            err_note = "malformed socket message: %s" % message
+            err.add_note(err_note)
+            err_to_raise = err
+        except Exception as err:
+            err_note = "Unable to process message '%s': %s" % (message, err)
+            err.add_note(err_note)
+            err_to_raise = err
+        if err_to_raise:
+            self.send({"error": err_note})
+            raise err_to_raise
 
     def on_close(self):
         # Remove client from the clients list and broadcast leave message
@@ -73,6 +77,7 @@ class HubDBListener(ChangeListener):
     Get events from Hub DB and propagate them through the
     websocket instance
     """
+
     def read(self, event):
         # self.socket is set while initalizing the websocket connection
         self.socket.publish(event)
@@ -89,10 +94,7 @@ class LogListener(ChangeListener):
             # make sure there's a loop in current thread
             try:
                 logging.disable(logging.CRITICAL)
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+                get_loop()
             finally:
                 logging.disable(logging.NOTSET)
 
